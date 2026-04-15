@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+backend.log
+image.png
+
+app/frontend/node_modules/
+app/frontend/dist/
+
+app/backend/session_index.json
