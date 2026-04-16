@@ -386,7 +386,12 @@ function App() {
         </div>
         {showButton && (
           <button 
-            onClick={() => setIsExpanded(!isExpanded)}
+            onClick={() => {
+              if (isExpanded && contentRef.current) {
+                contentRef.current.scrollTop = 0;
+              }
+              setIsExpanded(!isExpanded);
+            }}
             className="w-full py-2 mt-1 text-xs font-semibold text-gray-500 hover:text-gray-800 bg-gray-50/80 backdrop-blur-sm border border-gray-100 rounded-lg flex items-center justify-center gap-1 transition-colors sticky bottom-0 z-10"
           >
             {isExpanded ? (
@@ -445,6 +450,7 @@ function App() {
 
   const ToolBlock = ({ part, hooks, output, subagent_id }: { part: any, hooks?: any[], output?: any, subagent_id?: string }) => {
     const [isExpanded, setIsExpanded] = useState(false);
+    const fullLogSectionRef = useRef<HTMLDivElement>(null);
 
     const getBasename = (path: string) => {
       if (!path) return '';
@@ -671,7 +677,7 @@ function App() {
     return (
       <div className="my-4 border border-gray-200 rounded-xl overflow-hidden shadow-sm bg-white group ring-1 ring-black/5">
         <div 
-          className="bg-gray-50/80 px-4 py-3 border-b border-gray-200 flex items-center justify-between cursor-pointer hover:bg-gray-100 transition-colors"
+          className={`bg-gray-50/80 px-4 py-3 border-b border-gray-200 flex items-center justify-between cursor-pointer hover:bg-gray-100 transition-colors ${isExpanded ? 'sticky top-0 z-20 backdrop-blur-sm' : ''}`}
           onClick={() => setIsExpanded(!isExpanded)}
         >
           <div className="flex items-center gap-3 min-w-0">
@@ -767,7 +773,10 @@ function App() {
 
                 <div className="flex gap-2">
                   <button 
-                    onClick={(e) => { e.stopPropagation(); setShowFullLog(!showFullLog); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowFullLog(!showFullLog);
+                    }}
                     className="flex-1 flex items-center justify-center gap-2 py-3 bg-white text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-50 transition-all shadow-sm group"
                   >
                     <Activity size={14} className="group-hover:animate-pulse" /> 
@@ -783,8 +792,22 @@ function App() {
                 </div>
 
                 {showFullLog && (
-                  <div className="bg-gray-50/50 rounded-xl p-6 space-y-6 border border-gray-100 animate-in fade-in duration-300">
-                    {subagentLogs[agentId]?.map(e => renderEvent(e, true))}
+                  <div ref={fullLogSectionRef} className="bg-gray-50/50 rounded-xl border border-gray-100 animate-in fade-in duration-300 overflow-hidden">
+                    <div className="sticky top-0 z-10 bg-white/95 backdrop-blur-sm border-b border-gray-100 px-4 py-3 flex items-center justify-between">
+                      <div className="text-xs font-bold text-gray-600 uppercase tracking-wider">Full Conversation</div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          fullLogSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        }}
+                        className="text-[11px] font-semibold text-blue-600 hover:text-blue-700"
+                      >
+                        Jump to Start
+                      </button>
+                    </div>
+                    <div className="p-6 space-y-6">
+                      {subagentLogs[agentId]?.map(e => renderEvent(e, true))}
+                    </div>
                   </div>
                 )}
               </div>
@@ -808,24 +831,9 @@ function App() {
 
       if (!cleaned) return null;
 
-      if (cleaned.length > 500) {
-        return (
-          <div className="my-2 border border-gray-100 rounded-xl overflow-hidden shadow-sm bg-gray-50/20">
-            <div className="px-3 py-1.5 bg-gray-50 border-b border-gray-100 flex items-center gap-2 text-[10px] font-bold text-gray-400 uppercase">
-              <FileText size={12} /> Detailed Content
-            </div>
-            <ExpandableContent maxHeight={300} initiallyExpanded={isInsideTool}>
-              <div className="p-4 whitespace-pre-wrap text-gray-800 leading-relaxed font-sans text-sm break-all">
-                {cleaned}
-              </div>
-            </ExpandableContent>
-          </div>
-        );
-      }
-
       return (
         <ExpandableContent maxHeight={400} initiallyExpanded={isInsideTool}>
-          <div className="whitespace-pre-wrap text-gray-800 leading-relaxed break-all">{cleaned}</div>
+          <div className="whitespace-pre-wrap text-gray-800 leading-relaxed break-words">{cleaned}</div>
         </ExpandableContent>
       );
     }
@@ -845,7 +853,7 @@ function App() {
               </div>
             </div>
             <ExpandableContent maxHeight={300}>
-              <pre className="p-3 text-[11px] font-mono whitespace-pre-wrap bg-white overflow-x-auto text-gray-800 break-all">
+              <pre className="p-3 text-[11px] font-mono whitespace-pre-wrap bg-white overflow-x-auto text-gray-800 break-words">
                 {fileContent}
               </pre>
             </ExpandableContent>
@@ -895,31 +903,6 @@ function App() {
       return rendered.length > 0 ? <div className="space-y-4">{rendered}</div> : null;
     }
     return <div className="text-xs text-gray-400 italic font-mono">{JSON.stringify(content)}</div>;
-  };
-
-  const HeavyPrompt = ({ content }: { content: React.ReactNode }) => {
-    const [isExpanded, setIsExpanded] = useState(false);
-    
-    return (
-      <div className="border border-amber-100 bg-amber-50/30 rounded-xl p-4 my-2">
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-2 text-amber-700 font-semibold text-xs uppercase tracking-wider">
-            <AlertCircle size={14} /> Heavy Task
-          </div>
-          <button 
-            onClick={() => setIsExpanded(!isExpanded)}
-            className="text-[10px] font-bold text-amber-600 hover:text-amber-800 underline underline-offset-2 transition-colors"
-          >
-            {isExpanded ? 'Hide Details' : 'Show Details'}
-          </button>
-        </div>
-        {isExpanded && (
-          <div className="mt-4 pt-4 border-t border-amber-100 text-gray-800 leading-relaxed text-[15px]">
-            {content}
-          </div>
-        )}
-      </div>
-    );
   };
 
   const FrameComponent = ({ frame, frameIndex, children }: { frame: Frame, frameIndex: number, children: React.ReactNode }) => {
@@ -1026,9 +1009,7 @@ function App() {
       renderContent(event.content)
     ) : null;
 
-    const isHeavy = isUser && get_content_text(event.message?.content || "").length > 1000;
-
-    const content = isHeavy ? <HeavyPrompt content={rawContent} /> : rawContent;
+    const content = rawContent;
     const isCompactionBoundary = Boolean(
       event.is_compaction_boundary
       || (event.role_type === 'system'
@@ -1109,11 +1090,15 @@ function App() {
             </div>
 
             {thinking && (
-              <div className="mb-4 text-sm text-gray-500 italic border-l-2 border-gray-200 pl-4 py-1">
-                <details>
-                  <summary className="cursor-pointer hover:text-gray-700 font-medium">Thinking Process</summary>
-                  <div className="mt-2 whitespace-pre-wrap">{thinking}</div>
-                </details>
+              <div className="mb-4 border border-gray-100 rounded-xl overflow-hidden bg-gray-50/20">
+                <div className="px-3 py-1.5 bg-gray-50 border-b border-gray-100 text-[10px] font-bold text-gray-400 uppercase tracking-wider">
+                  Thinking
+                </div>
+                <ExpandableContent maxHeight={220}>
+                  <div className="p-3 whitespace-pre-wrap text-gray-700 leading-relaxed text-sm break-words">
+                    {thinking}
+                  </div>
+                </ExpandableContent>
               </div>
             )}
 

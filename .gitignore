@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 
 backend.log
-image.png
 
 app/frontend/node_modules/
 app/frontend/dist/

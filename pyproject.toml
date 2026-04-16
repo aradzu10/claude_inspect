@@ -1,0 +1,13 @@
+[project]
+name = "claude-inspect"
+version = "0.1.0"
+description = "Claude Inspect backend environment"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "pydantic",
+    "uvicorn",
+]
+
+[tool.uv]
+package = false
