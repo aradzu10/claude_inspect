@@ -81,7 +81,8 @@ def save_index_state(state: Dict[str, Any]) -> None:
 def extract_session_metadata(session_file: Path) -> Dict[str, Any]:
     title = session_file.stem
     cwd_path: Optional[str] = None
-    title_found = False
+    slug_title: Optional[str] = None
+    custom_title: Optional[str] = None
 
     try:
         with open(session_file, "r") as handle:
@@ -102,18 +103,17 @@ def extract_session_metadata(session_file: Path) -> Dict[str, Any]:
 
                 if isinstance(data, dict):
                     if data.get("type") == "custom-title" and data.get("customTitle"):
-                        title = str(data.get("customTitle"))
-                        title_found = True
-                    elif data.get("slug"):
-                        title = str(data.get("slug"))
-                        title_found = True
+                        custom_title = str(data.get("customTitle"))
+                    elif not slug_title and data.get("slug"):
+                        slug_title = str(data.get("slug"))
 
-                if cwd_path and title_found:
+                if cwd_path and custom_title:
                     break
     except Exception:
         logger.warning("Could not parse metadata for session file %s", session_file)
 
-    return {"cwd": cwd_path, "title": title}
+    title = custom_title or slug_title or title
+    return {"cwd": cwd_path, "title": title, "slug": slug_title, "name": custom_title}
 
 def discover_sessions() -> List[Dict[str, Any]]:
     sessions: List[Dict[str, Any]] = []
@@ -142,6 +142,8 @@ def discover_sessions() -> List[Dict[str, Any]]:
         sessions.append({
             "id": session_id,
             "title": metadata.get("title") or session_id,
+            "slug": metadata.get("slug"),
+            "name": metadata.get("name"),
             "path": str(session_file),
             "size_mb": stat.st_size / (1024 * 1024),
             "mtime": stat.st_mtime,
@@ -168,6 +170,8 @@ def build_sessions_payload(search: str = "") -> Dict[str, Any]:
         sid: {
             "id": rec["id"],
             "title": rec["title"],
+            "slug": rec.get("slug"),
+            "name": rec.get("name"),
             "project_name": rec["project_name"],
             "session_file_path": rec["session_file_path"],
             "session_dir_path": rec["session_dir_path"],
@@ -209,6 +213,8 @@ def build_sessions_payload(search: str = "") -> Dict[str, Any]:
                 "sessions": [
                     session for session in project["sessions"]
                     if search_query in session["title"].lower()
+                    or search_query in str(session.get("slug", "")).lower()
+                    or search_query in str(session.get("name", "")).lower()
                     or search_query in session["id"].lower()
                     or search_query in project["name"].lower()
                 ],
@@ -224,6 +230,8 @@ def build_sessions_payload(search: str = "") -> Dict[str, Any]:
             session
             for session in recent_sessions
             if search_query in session["title"].lower()
+            or search_query in str(session.get("slug", "")).lower()
+            or search_query in str(session.get("name", "")).lower()
             or search_query in session["id"].lower()
             or search_query in session["project_name"].lower()
         ]
@@ -251,6 +259,8 @@ def get_session_record(session_id: str) -> Dict[str, Any]:
         sid: {
             "id": rec["id"],
             "title": rec["title"],
+            "slug": rec.get("slug"),
+            "name": rec.get("name"),
             "project_name": rec["project_name"],
             "session_file_path": rec["session_file_path"],
             "session_dir_path": rec["session_dir_path"],

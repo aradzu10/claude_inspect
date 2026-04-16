@@ -69,6 +69,8 @@ interface Event {
 interface Session {
   id: string;
   title: string;
+  slug?: string;
+  name?: string;
   path: string;
   size_mb: number;
   mtime?: number;
@@ -340,6 +342,18 @@ function App() {
     const hh = String(date.getHours()).padStart(2, '0');
     const min = String(date.getMinutes()).padStart(2, '0');
     return `${dd}/${mm}/${yy} ${hh}:${min}`;
+  };
+
+  const getSessionDisplayTitle = (session?: Session | null) => (
+    session?.name || session?.slug || session?.title || session?.id || 'Unknown'
+  );
+
+  const getSessionSlugNameLabel = (session?: Session | null) => {
+    if (!session) return '';
+    const labels: string[] = [];
+    if (session.name) labels.push(`name: ${session.name}`);
+    if (session.slug) labels.push(`slug: ${session.slug}`);
+    return labels.join(' · ');
   };
 
   const selectSession = (sessionId: string, projectId?: string) => {
@@ -1270,10 +1284,13 @@ function App() {
                 >
                   <div className="flex items-center justify-between mb-1">
                     <span className={`text-sm font-medium ${selectedSessionId === s.id ? 'text-blue-600' : 'text-gray-700'}`}>
-                      {s.title ? trimText(s.title, 25) : (s.id ? s.id.split('-')[0] : 'Unknown')}
+                      {trimText(getSessionDisplayTitle(s), 25)}
                     </span>
                     <span className="text-[10px] text-gray-400 font-mono">{s.size_mb.toFixed(1)} MB</span>
                   </div>
+                  {getSessionSlugNameLabel(s) ? (
+                    <div className="text-[10px] text-gray-500 truncate">{getSessionSlugNameLabel(s)}</div>
+                  ) : null}
                   <div className="text-[11px] text-gray-400 font-mono truncate">{s.id}</div>
                   <div className="text-[10px] text-gray-400">{formatSessionDateTime(s.mtime)}</div>
                 </button>
@@ -1317,8 +1334,11 @@ function App() {
                           }`}
                         >
                           <div className={`text-sm font-medium ${selectedSessionId === session.id ? 'text-blue-600' : 'text-gray-700'} truncate`}>
-                            {session.title}
+                            {getSessionDisplayTitle(session)}
                           </div>
+                          {getSessionSlugNameLabel(session) ? (
+                            <div className="text-[10px] text-gray-500 truncate">{getSessionSlugNameLabel(session)}</div>
+                          ) : null}
                           <div className="text-[10px] text-gray-400 font-mono truncate">{session.id}</div>
                           <div className="text-[10px] text-gray-400">{formatSessionDateTime(session.mtime)}</div>
                         </button>
@@ -1345,8 +1365,11 @@ function App() {
                   </div>
                   <div className="text-sm font-semibold text-gray-900 flex items-center gap-2">
                     <History size={16} className="text-gray-400" />
-                    Session: {selectedSession?.title || selectedSessionId}
+                    Session: {getSessionDisplayTitle(selectedSession) || selectedSessionId}
                   </div>
+                  {getSessionSlugNameLabel(selectedSession) ? (
+                    <div className="text-[11px] text-gray-500 mt-0.5">{getSessionSlugNameLabel(selectedSession)}</div>
+                  ) : null}
                   {selectedSession?.mtime ? (
                     <div className="text-sm font-semibold text-gray-900 flex items-center gap-2 mt-1">
                       <Clock size={16} className="text-gray-400" />
@@ -1510,7 +1533,10 @@ function App() {
                           onClick={() => selectSession(session.id, project.id)}
                           className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 border border-transparent hover:border-gray-100"
                         >
-                          <div className="text-sm font-medium text-gray-700 truncate">{session.title}</div>
+                          <div className="text-sm font-medium text-gray-700 truncate">{getSessionDisplayTitle(session)}</div>
+                          {getSessionSlugNameLabel(session) ? (
+                            <div className="text-[10px] text-gray-500 truncate">{getSessionSlugNameLabel(session)}</div>
+                          ) : null}
                           <div className="text-[10px] text-gray-400 font-mono truncate">{session.id}</div>
                           <div className="text-[10px] text-gray-400">{formatSessionDateTime(session.mtime)}</div>
                         </button>
