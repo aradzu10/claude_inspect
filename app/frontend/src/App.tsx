@@ -17,7 +17,13 @@ import {
   ArrowUpRight,
   Clock,
   X,
-  Folder
+  Folder,
+  Eye,
+  EyeOff,
+  Trash2,
+  Check,
+  Copy,
+  Info
 } from 'lucide-react';
 
 interface TokenUsage {
@@ -102,21 +108,79 @@ interface Analysis {
   frames: Frame[];
 }
 
+const HIDDEN_SESSIONS_STORAGE_KEY = 'claude-inspect.hidden-session-ids';
+const HIDE_TOAST_DURATION_MS = 5000;
+
 function App() {
   const [recentSessions, setRecentSessions] = useState<Session[]>([]);
   const [projects, setProjects] = useState<ProjectGroup[]>([]);
+  const [hiddenSessionIds, setHiddenSessionIds] = useState<string[]>(() => {
+    try {
+      const raw = window.localStorage.getItem(HIDDEN_SESSIONS_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((id): id is string => typeof id === 'string');
+    } catch {
+      return [];
+    }
+  });
+  const [showHiddenOnMain, setShowHiddenOnMain] = useState(false);
+  const [hideToast, setHideToast] = useState<{ sessionId: string; label: string } | null>(null);
+  const [hideToastProgress, setHideToastProgress] = useState(100);
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [events, setEvents] = useState<Event[]>([]);
+  const [eventCounts, setEventCounts] = useState({ withSubagents: 0, withoutSubagents: 0 });
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<string | null>(null);
   const [subagentLogs, setSubagentLogs] = useState<Record<string, Event[]>>({});
   const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
+  const [showSessionMeta, setShowSessionMeta] = useState(false);
+  const [projectPathCopyState, setProjectPathCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
   const messageRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const analysisEventSourceRef = useRef<EventSource | null>(null);
   const pendingSubagentFetchesRef = useRef<Set<string>>(new Set());
+  const mainContentScrollRef = useRef<HTMLDivElement>(null);
+
+  const getSessionIdFromUrl = (): string | null => {
+    const id = new URL(window.location.href).searchParams.get('session');
+    return id && id.trim() ? id : null;
+  };
+
+  const updateUrlForSession = (sessionId: string | null, mode: 'push' | 'replace' = 'push') => {
+    const url = new URL(window.location.href);
+    if (sessionId) {
+      url.searchParams.set('session', sessionId);
+    } else {
+      url.searchParams.delete('session');
+    }
+    const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+    if (mode === 'replace') {
+      window.history.replaceState(null, '', nextUrl);
+    } else {
+      window.history.pushState(null, '', nextUrl);
+    }
+  };
+
+  useEffect(() => {
+    const initialSessionId = getSessionIdFromUrl();
+    if (initialSessionId) {
+      setSelectedSessionId(initialSessionId);
+    }
+
+    const onPopState = () => {
+      setSelectedSessionId(getSessionIdFromUrl());
+      setActiveSubagentId(null);
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+    };
+  }, []);
 
   useEffect(() => {
     const query = searchQuery.trim();
@@ -140,10 +204,33 @@ function App() {
   }, [searchQuery]);
 
   useEffect(() => {
+    window.localStorage.setItem(HIDDEN_SESSIONS_STORAGE_KEY, JSON.stringify(hiddenSessionIds));
+  }, [hiddenSessionIds]);
+
+  useEffect(() => {
+    if (!hideToast) return;
+    const startedAt = Date.now();
+    setHideToastProgress(100);
+    const intervalId = window.setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const remaining = Math.max(0, HIDE_TOAST_DURATION_MS - elapsed);
+      setHideToastProgress((remaining / HIDE_TOAST_DURATION_MS) * 100);
+      if (remaining === 0) {
+        setHideToast(null);
+      }
+    }, 50);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [hideToast]);
+
+  useEffect(() => {
     if (selectedSessionId) {
       setLoading(true);
       setAnalysis(null);
       setAnalysisProgress(null);
+      setEventCounts({ withSubagents: 0, withoutSubagents: 0 });
 
       const controller = new AbortController();
       const signal = controller.signal;
@@ -157,15 +244,25 @@ function App() {
             throw new Error('Failed to load session');
           }
           return res.json();
-        })
+        }),
+        fetch(`/api/session/${selectedSessionId}?include_subagents=true`, { signal })
+          .then(res => (res.ok ? res.json() : null))
+          .catch(() => null)
       ])
-        .then(([analysisData, sessionData]) => {
+        .then(([analysisData, sessionData, withSubagentsData]) => {
+          const sessionEvents = Array.isArray(sessionData) ? sessionData : [];
+          const allEvents = Array.isArray(withSubagentsData) ? withSubagentsData : sessionEvents;
           setAnalysis(analysisData);
-          setEvents(Array.isArray(sessionData) ? sessionData : []);
+          setEvents(sessionEvents);
+          setEventCounts({
+            withSubagents: allEvents.length,
+            withoutSubagents: sessionEvents.length,
+          });
         })
         .catch((error) => {
           if (error.name !== 'AbortError') {
             setEvents([]);
+            setEventCounts({ withSubagents: 0, withoutSubagents: 0 });
           }
         })
         .finally(() => {
@@ -184,6 +281,21 @@ function App() {
       analysisEventSourceRef.current = null;
     }
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    setShowSessionMeta(false);
+    setProjectPathCopyState('idle');
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (projectPathCopyState === 'idle') return;
+    const timeoutId = window.setTimeout(() => {
+      setProjectPathCopyState('idle');
+    }, 1500);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [projectPathCopyState]);
 
   useEffect(() => {
     return () => {
@@ -305,6 +417,57 @@ function App() {
     }
   };
 
+  const smoothScrollContainerBy = (container: HTMLDivElement, deltaY: number, durationMs = 700) => {
+    if (Math.abs(deltaY) < 1) return;
+    const startTop = container.scrollTop;
+    const targetTop = startTop + deltaY;
+    const startTs = performance.now();
+    const easeInOut = (t: number) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+
+    const tick = (now: number) => {
+      const elapsed = now - startTs;
+      const progress = Math.min(1, elapsed / durationMs);
+      container.scrollTop = startTop + (targetTop - startTop) * easeInOut(progress);
+      if (progress < 1) {
+        requestAnimationFrame(tick);
+      }
+    };
+    requestAnimationFrame(tick);
+  };
+
+  const nudgeIntoViewIfPartiallyVisible = (
+    element: HTMLElement,
+    {
+      topOffset = 1,
+      bottomOffset = 8,
+      allowBelowNudge = false,
+      maxAboveNudge = 28,
+    }: { topOffset?: number; bottomOffset?: number; allowBelowNudge?: boolean; maxAboveNudge?: number } = {}
+  ) => {
+    const container = mainContentScrollRef.current;
+    if (!container) return;
+
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const visibleTop = containerRect.top + topOffset;
+    const visibleBottom = containerRect.bottom - bottomOffset;
+
+    const partiallyVisibleFromAbove = elementRect.top < visibleTop && elementRect.bottom > visibleTop;
+    if (partiallyVisibleFromAbove) {
+      const rawDelta = elementRect.top - visibleTop;
+      const limitedDelta = Math.max(rawDelta, -maxAboveNudge);
+      smoothScrollContainerBy(container, limitedDelta);
+      return;
+    }
+
+    if (!allowBelowNudge) return;
+
+    const partiallyVisibleFromBelow = elementRect.bottom > visibleBottom && elementRect.top < visibleBottom;
+    if (partiallyVisibleFromBelow) {
+      smoothScrollContainerBy(container, elementRect.bottom - visibleBottom);
+    }
+  };
+
   const trimText = (text: string, limit: number, fromLeft = false) => {
     if (!text || text.length <= limit) return text;
     if (fromLeft) return '...' + text.slice(-(limit - 3));
@@ -333,6 +496,15 @@ function App() {
     return `.../${tail}`;
   };
 
+  const compactProjectPathTail = (projectPath: string, segmentCount = 2) => {
+    if (!projectPath) return '';
+    const normalized = projectPath.replace(/\/+$/, '');
+    const parts = normalized.split('/').filter(Boolean);
+    if (parts.length === 0) return normalized;
+    if (parts.length <= segmentCount) return normalized;
+    return `.../${parts.slice(-segmentCount).join('/')}`;
+  };
+
   const formatSessionDateTime = (mtime?: number) => {
     if (!mtime) return '';
     const date = new Date(mtime * 1000);
@@ -348,15 +520,40 @@ function App() {
     session?.name || session?.slug || session?.title || session?.id || 'Unknown'
   );
 
-  const getSessionSlugNameLabel = (session?: Session | null) => {
-    if (!session) return '';
-    const labels: string[] = [];
-    if (session.name) labels.push(`name: ${session.name}`);
-    if (session.slug) labels.push(`slug: ${session.slug}`);
-    return labels.join(' · ');
+  const hiddenSessionSet = new Set(hiddenSessionIds);
+  const buildProjectGroups = (includeHidden: boolean) => {
+    const filtered = projects
+      .map(project => {
+        const sessions = project.sessions.filter(session =>
+          includeHidden ? hiddenSessionSet.has(session.id) : !hiddenSessionSet.has(session.id)
+        );
+        const latestMtime = sessions.reduce((latest, session) => {
+          const mtime = session.mtime ?? 0;
+          return mtime > latest ? mtime : latest;
+        }, 0);
+        return {
+          ...project,
+          sessions,
+          latest_mtime: latestMtime,
+        };
+      })
+      .filter(project => project.sessions.length > 0);
+
+    filtered.sort((a, b) => {
+      const byTime = (b.latest_mtime ?? 0) - (a.latest_mtime ?? 0);
+      if (byTime !== 0) return byTime;
+      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    });
+    return filtered;
   };
+  const visibleProjects = buildProjectGroups(false);
+  const hiddenProjects = buildProjectGroups(true);
+  const sidebarRecentSessions = recentSessions.filter(session => !hiddenSessionSet.has(session.id));
 
   const selectSession = (sessionId: string, projectId?: string) => {
+    if (sessionId !== selectedSessionId) {
+      updateUrlForSession(sessionId);
+    }
     setSelectedSessionId(sessionId);
     setRecentSessions(prev => {
       const allSessions = [...prev, ...projects.flatMap(project => project.sessions)];
@@ -371,11 +568,53 @@ function App() {
     fetch(`/api/session/${sessionId}/recent`, { method: 'POST' }).catch(() => null);
   };
 
+  const clearSelectedSession = () => {
+    setSelectedSessionId(null);
+    setActiveSubagentId(null);
+    updateUrlForSession(null);
+  };
+
+  const removeRecentSession = (sessionId: string) => {
+    setRecentSessions(prev => prev.filter(session => session.id !== sessionId));
+    fetch(`/api/session/${sessionId}/recent/remove`, { method: 'POST' }).catch(() => null);
+  };
+
+  const hideSession = (session: Session) => {
+    setHiddenSessionIds(prev => (prev.includes(session.id) ? prev : [...prev, session.id]));
+    removeRecentSession(session.id);
+    if (selectedSessionId === session.id) {
+      clearSelectedSession();
+    }
+    setHideToast({ sessionId: session.id, label: getSessionDisplayTitle(session) });
+  };
+
+  const undoHide = () => {
+    if (!hideToast) return;
+    setHiddenSessionIds(prev => prev.filter(id => id !== hideToast.sessionId));
+    setHideToast(null);
+  };
+
+  const unhideSession = (sessionId: string) => {
+    setHiddenSessionIds(prev => prev.filter(id => id !== sessionId));
+  };
+
   const selectedSession =
     recentSessions.find(s => s.id === selectedSessionId)
     || projects.flatMap(project => project.sessions).find(s => s.id === selectedSessionId)
     || null;
-  const selectedProjectName = selectedSession?.project_name || '';
+  const selectedProjectPath = selectedSession?.project_name || '';
+  const selectedProjectPathShort = compactProjectPathTail(selectedProjectPath, 2);
+
+  const copyProjectPath = async () => {
+    if (!selectedProjectPath) return;
+    try {
+      await navigator.clipboard.writeText(selectedProjectPath);
+      setProjectPathCopyState('copied');
+    } catch (error) {
+      console.error('Failed to copy project path', error);
+      setProjectPathCopyState('error');
+    }
+  };
 
   const ExpandableContent = ({ children, maxHeight = 300, initiallyExpanded = false }: { children: React.ReactNode, maxHeight?: number, initiallyExpanded?: boolean }) => {
     const [isExpanded, setIsExpanded] = useState(initiallyExpanded);
@@ -464,7 +703,68 @@ function App() {
 
   const ToolBlock = ({ part, hooks, output, subagent_id }: { part: any, hooks?: any[], output?: any, subagent_id?: string }) => {
     const [isExpanded, setIsExpanded] = useState(false);
+    const [isStickyActive, setIsStickyActive] = useState(false);
+    const [isToolHeaderStuck, setIsToolHeaderStuck] = useState(false);
+    const [isFullLogHeaderStuck, setIsFullLogHeaderStuck] = useState(false);
     const fullLogSectionRef = useRef<HTMLDivElement>(null);
+    const fullLogHeaderRef = useRef<HTMLDivElement>(null);
+    const toolBlockRef = useRef<HTMLDivElement>(null);
+    const toolHeaderRef = useRef<HTMLDivElement>(null);
+    const stickyActivationTimerRef = useRef<number | null>(null);
+    const collapseTimerRef = useRef<number | null>(null);
+    const [toolHeaderHeight, setToolHeaderHeight] = useState(56);
+
+    const toggleExpanded = () => {
+      if (stickyActivationTimerRef.current) {
+        window.clearTimeout(stickyActivationTimerRef.current);
+        stickyActivationTimerRef.current = null;
+      }
+      if (collapseTimerRef.current) {
+        window.clearTimeout(collapseTimerRef.current);
+        collapseTimerRef.current = null;
+      }
+
+      if (isExpanded) {
+        setIsStickyActive(false);
+        setIsToolHeaderStuck(false);
+        setIsFullLogHeaderStuck(false);
+
+        const shouldScrollBack = isToolHeaderStuck || isFullLogHeaderStuck;
+        if (!shouldScrollBack) {
+          setIsExpanded(false);
+          return;
+        }
+
+        const container = mainContentScrollRef.current;
+        const block = toolBlockRef.current;
+        if (container && block) {
+          const containerRect = container.getBoundingClientRect();
+          const blockRect = block.getBoundingClientRect();
+          const blockTop = blockRect.top - containerRect.top + container.scrollTop;
+          const targetTop = Math.max(0, blockTop - 12);
+          container.scrollTo({ top: targetTop, behavior: 'smooth' });
+          collapseTimerRef.current = window.setTimeout(() => {
+            setIsExpanded(false);
+            collapseTimerRef.current = null;
+          }, 220);
+        } else {
+          setIsExpanded(false);
+        }
+        return;
+      }
+
+      setIsExpanded(true);
+      setIsStickyActive(false);
+      requestAnimationFrame(() => {
+        if (toolHeaderRef.current) {
+          nudgeIntoViewIfPartiallyVisible(toolHeaderRef.current, { topOffset: 0, maxAboveNudge: 2000 });
+        }
+        stickyActivationTimerRef.current = window.setTimeout(() => {
+          setIsStickyActive(true);
+          stickyActivationTimerRef.current = null;
+        }, 260);
+      });
+    };
 
     const getBasename = (path: string) => {
       if (!path) return '';
@@ -652,11 +952,97 @@ function App() {
 
     const [showFullLog, setShowFullLog] = useState(false);
     const agentId = subagent_id || part.subagent_id || part.input?.agent_id;
+
+    useEffect(() => {
+      if (!isExpanded || !toolHeaderRef.current) return;
+      setToolHeaderHeight(Math.ceil(toolHeaderRef.current.getBoundingClientRect().height));
+    }, [isExpanded, showFullLog]);
+
     useEffect(() => {
       if (agentId && !subagentLogs[agentId]) {
         fetchSubagentLogs(agentId);
       }
     }, [agentId]);
+
+    useEffect(() => {
+      if (!isExpanded || !isStickyActive) {
+        setIsToolHeaderStuck(false);
+        return;
+      }
+
+      const onScroll = () => {
+        const headerEl = toolHeaderRef.current;
+        const blockEl = toolBlockRef.current;
+        if (!headerEl || !blockEl) {
+          setIsToolHeaderStuck(false);
+          return;
+        }
+
+        const scrollContainer = mainContentScrollRef.current;
+        const containerTop = scrollContainer ? scrollContainer.getBoundingClientRect().top : 0;
+        const headerRect = headerEl.getBoundingClientRect();
+        const blockRect = blockEl.getBoundingClientRect();
+        const stuckAtTop = Math.abs(headerRect.top - containerTop) <= 1.5;
+        const hasScrollableContent = (blockRect.bottom - containerTop) > (headerRect.height + 1);
+        setIsToolHeaderStuck(stuckAtTop && hasScrollableContent);
+      };
+
+      const scrollContainer = mainContentScrollRef.current;
+      const target: EventTarget = scrollContainer || window;
+      onScroll();
+      target.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll);
+      return () => {
+        target.removeEventListener('scroll', onScroll);
+        window.removeEventListener('resize', onScroll);
+      };
+    }, [isExpanded, isStickyActive]);
+
+    useEffect(() => {
+      if (!isExpanded || !showFullLog || !isStickyActive) {
+        setIsFullLogHeaderStuck(false);
+        return;
+      }
+
+      const onScroll = () => {
+        const headerEl = fullLogHeaderRef.current;
+        const sectionEl = fullLogSectionRef.current;
+        if (!headerEl || !sectionEl) {
+          setIsFullLogHeaderStuck(false);
+          return;
+        }
+
+        const scrollContainer = mainContentScrollRef.current;
+        const containerTop = scrollContainer ? scrollContainer.getBoundingClientRect().top : 0;
+        const stickyTop = containerTop + toolHeaderHeight;
+        const headerRect = headerEl.getBoundingClientRect();
+        const sectionRect = sectionEl.getBoundingClientRect();
+        const stuckAtTop = Math.abs(headerRect.top - stickyTop) <= 1.5;
+        const hasScrollableContent = (sectionRect.bottom - stickyTop) > (headerRect.height + 1);
+        setIsFullLogHeaderStuck(stuckAtTop && hasScrollableContent);
+      };
+
+      const scrollContainer = mainContentScrollRef.current;
+      const target: EventTarget = scrollContainer || window;
+      onScroll();
+      target.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll);
+      return () => {
+        target.removeEventListener('scroll', onScroll);
+        window.removeEventListener('resize', onScroll);
+      };
+    }, [isExpanded, showFullLog, isStickyActive, toolHeaderHeight]);
+
+    useEffect(() => {
+      return () => {
+        if (stickyActivationTimerRef.current) {
+          window.clearTimeout(stickyActivationTimerRef.current);
+        }
+        if (collapseTimerRef.current) {
+          window.clearTimeout(collapseTimerRef.current);
+        }
+      };
+    }, []);
 
     const preHooks = hooks?.filter(h => h.attachment?.hookEvent === 'PreToolUse' || h.hookEvent === 'PreToolUse' || h.attachment?.hookName?.includes('Pre')) || [];
     const postHooks = hooks?.filter(h => h.attachment?.hookEvent === 'PostToolUse' || h.hookEvent === 'PostToolUse' || h.attachment?.hookName?.includes('Post')) || [];
@@ -689,10 +1075,18 @@ function App() {
     };
 
     return (
-      <div className="my-4 border border-gray-200 rounded-xl overflow-hidden shadow-sm bg-white group ring-1 ring-black/5">
+      <div
+        ref={toolBlockRef}
+        className={`my-4 border border-gray-200 shadow-sm bg-white group ring-1 ring-black/5 ${
+          isExpanded
+            ? `${isToolHeaderStuck ? 'rounded-t-none' : 'rounded-t-xl'} rounded-b-none overflow-visible`
+            : 'rounded-xl overflow-hidden'
+        }`}
+      >
         <div 
-          className={`bg-gray-50/80 px-4 py-3 border-b border-gray-200 flex items-center justify-between cursor-pointer hover:bg-gray-100 transition-colors ${isExpanded ? 'sticky top-0 z-20 backdrop-blur-sm' : ''}`}
-          onClick={() => setIsExpanded(!isExpanded)}
+          ref={toolHeaderRef}
+          className={`bg-gray-50/80 ${isToolHeaderStuck ? 'rounded-t-none' : 'rounded-t-xl'} px-4 py-3 border-b border-gray-200 flex items-center justify-between cursor-pointer hover:bg-gray-100 transition-colors ${isExpanded && isStickyActive ? 'sticky top-0 z-20 backdrop-blur-sm' : ''}`}
+          onClick={toggleExpanded}
         >
           <div className="flex items-center gap-3 min-w-0">
             <div className="bg-white p-1.5 rounded-lg border border-gray-200 shadow-sm shrink-0">
@@ -789,7 +1183,8 @@ function App() {
                   <button 
                     onClick={(e) => {
                       e.stopPropagation();
-                      setShowFullLog(!showFullLog);
+                      const nextShowFullLog = !showFullLog;
+                      setShowFullLog(nextShowFullLog);
                     }}
                     className="flex-1 flex items-center justify-center gap-2 py-3 bg-white text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-50 transition-all shadow-sm group"
                   >
@@ -806,13 +1201,28 @@ function App() {
                 </div>
 
                 {showFullLog && (
-                  <div ref={fullLogSectionRef} className="bg-gray-50/50 rounded-xl border border-gray-100 animate-in fade-in duration-300 overflow-hidden">
-                    <div className="sticky top-0 z-10 bg-white/95 backdrop-blur-sm border-b border-gray-100 px-4 py-3 flex items-center justify-between">
+                  <div
+                    ref={fullLogSectionRef}
+                    className={`bg-gray-50/50 border border-gray-100 animate-in fade-in duration-300 overflow-visible ${isFullLogHeaderStuck ? 'rounded-t-none' : 'rounded-t-xl'} rounded-b-xl`}
+                  >
+                    <div
+                      ref={fullLogHeaderRef}
+                      className={`sticky z-30 bg-white/95 backdrop-blur-sm border-b border-gray-100 px-4 py-3 flex items-center justify-between ${isFullLogHeaderStuck ? 'rounded-t-none' : 'rounded-t-xl'}`}
+                      style={{ top: `${toolHeaderHeight}px` }}
+                    >
                       <div className="text-xs font-bold text-gray-600 uppercase tracking-wider">Full Conversation</div>
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          fullLogSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                          const container = mainContentScrollRef.current;
+                          const section = fullLogSectionRef.current;
+                          if (!container || !section) return;
+                          const containerTop = container.getBoundingClientRect().top;
+                          const sectionTop = section.getBoundingClientRect().top;
+                          container.scrollBy({
+                            top: sectionTop - containerTop - toolHeaderHeight,
+                            behavior: 'smooth'
+                          });
                         }}
                         className="text-[11px] font-semibold text-blue-600 hover:text-blue-700"
                       >
@@ -876,14 +1286,17 @@ function App() {
       }
 
       if (content.type === 'deferred_tools_delta') {
+        const toolNames = Array.isArray(content.addedNames) ? content.addedNames : [];
         return (
           <div className="my-2 p-3 bg-blue-50/30 border border-blue-100 rounded-lg">
             <div className="text-[10px] font-bold text-blue-600 uppercase mb-2">Tools Available</div>
-            <div className="flex flex-wrap gap-1.5">
-              {content.addedNames.map((n: string) => (
-                <span key={n} className="px-2 py-0.5 bg-white border border-blue-100 text-blue-700 rounded text-[10px] font-mono">{n}</span>
-              ))}
-            </div>
+            <ExpandableContent maxHeight={84}>
+              <div className="flex flex-wrap gap-1.5">
+                {toolNames.map((n: string) => (
+                  <span key={n} className="px-2 py-0.5 bg-white border border-blue-100 text-blue-700 rounded text-[10px] font-mono break-all">{n}</span>
+                ))}
+              </div>
+            </ExpandableContent>
           </div>
         );
       }
@@ -891,7 +1304,9 @@ function App() {
         return (
           <div className="my-2 p-3 bg-purple-50/30 border border-purple-100 rounded-lg">
             <div className="text-[10px] font-bold text-purple-600 uppercase mb-2">Skills Available ({content.skillCount})</div>
-            <pre className="text-[11px] font-mono text-gray-700 whitespace-pre-wrap">{content.content}</pre>
+            <ExpandableContent maxHeight={140}>
+              <pre className="text-[11px] font-mono text-gray-700 whitespace-pre-wrap">{content.content}</pre>
+            </ExpandableContent>
           </div>
         );
       }
@@ -1247,10 +1662,7 @@ function App() {
       <aside className="w-80 border-r border-gray-100 flex flex-col bg-gray-50/50">
         <div className="p-6 border-b border-gray-100 bg-white">
           <button
-            onClick={() => {
-              setSelectedSessionId(null);
-              setActiveSubagentId(null);
-            }}
+            onClick={clearSelectedSession}
             className="flex items-center gap-3 mb-6"
           >
             <div className="bg-blue-600 p-2 rounded-lg shadow-sm shadow-blue-200">
@@ -1272,28 +1684,36 @@ function App() {
           <div>
             <div className="px-3 mb-2 text-[10px] font-bold text-gray-400 uppercase tracking-widest">Recent Sessions</div>
             <div className="space-y-1">
-              {recentSessions.map(s => (
-                <button
-                  key={`recent-${s.id}`}
-                  onClick={() => selectSession(s.id)}
-                  className={`w-full text-left px-4 py-3 rounded-xl transition-all duration-200 group ${
-                    selectedSessionId === s.id
-                      ? 'bg-white shadow-sm border border-gray-100'
-                      : 'hover:bg-white/50 border border-transparent'
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className={`text-sm font-medium ${selectedSessionId === s.id ? 'text-blue-600' : 'text-gray-700'}`}>
-                      {trimText(getSessionDisplayTitle(s), 25)}
-                    </span>
-                    <span className="text-[10px] text-gray-400 font-mono">{s.size_mb.toFixed(1)} MB</span>
-                  </div>
-                  {getSessionSlugNameLabel(s) ? (
-                    <div className="text-[10px] text-gray-500 truncate">{getSessionSlugNameLabel(s)}</div>
-                  ) : null}
-                  <div className="text-[11px] text-gray-400 font-mono truncate">{s.id}</div>
-                  <div className="text-[10px] text-gray-400">{formatSessionDateTime(s.mtime)}</div>
-                </button>
+              {sidebarRecentSessions.map(s => (
+                <div key={`recent-${s.id}`} className="group">
+                  <button
+                    onClick={() => selectSession(s.id)}
+                    className={`w-full text-left px-4 py-3 rounded-xl transition-all duration-200 ${
+                      selectedSessionId === s.id
+                        ? 'bg-white shadow-sm border border-gray-100'
+                        : 'hover:bg-white/50 border border-transparent'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2 mb-1">
+                      <div className={`text-sm font-medium min-w-0 ${selectedSessionId === s.id ? 'text-blue-600' : 'text-gray-700'}`}>
+                        {trimText(getSessionDisplayTitle(s), 25)}
+                      </div>
+                      <button
+                        type="button"
+                        title="remove recent"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeRecentSession(s.id);
+                        }}
+                        className="p-1 -mr-1 text-gray-400 hover:text-gray-600 transition-colors shrink-0"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                    <div className="text-[11px] text-gray-400 font-mono break-all">{s.id}</div>
+                    <div className="text-[10px] text-gray-400">{formatSessionDateTime(s.mtime)}</div>
+                  </button>
+                </div>
               ))}
             </div>
           </div>
@@ -1301,7 +1721,7 @@ function App() {
           <div>
             <div className="px-3 mb-2 text-[10px] font-bold text-gray-400 uppercase tracking-widest">Projects</div>
             <div className="space-y-1">
-              {projects.map(project => (
+              {visibleProjects.map(project => (
                 <div key={project.id} className="rounded-xl border border-transparent hover:border-gray-100">
                   <button
                     onClick={() => setExpandedProjects(prev => ({ ...prev, [project.id]: !prev[project.id] }))}
@@ -1324,24 +1744,35 @@ function App() {
                       <div className="border-t border-gray-200 my-1"></div>
                       <div className="space-y-1">
                       {project.sessions.map(session => (
-                        <button
-                          key={`${project.id}-${session.id}`}
-                          onClick={() => selectSession(session.id, project.id)}
-                          className={`w-full text-left px-3 py-2 rounded-lg transition-all ${
-                            selectedSessionId === session.id
-                              ? 'bg-white border border-gray-100 shadow-sm'
-                              : 'hover:bg-white/60 border border-transparent'
-                          }`}
-                        >
-                          <div className={`text-sm font-medium ${selectedSessionId === session.id ? 'text-blue-600' : 'text-gray-700'} truncate`}>
-                            {getSessionDisplayTitle(session)}
-                          </div>
-                          {getSessionSlugNameLabel(session) ? (
-                            <div className="text-[10px] text-gray-500 truncate">{getSessionSlugNameLabel(session)}</div>
-                          ) : null}
-                          <div className="text-[10px] text-gray-400 font-mono truncate">{session.id}</div>
-                          <div className="text-[10px] text-gray-400">{formatSessionDateTime(session.mtime)}</div>
-                        </button>
+                        <div key={`${project.id}-${session.id}`} className="group">
+                          <button
+                            onClick={() => selectSession(session.id, project.id)}
+                            className={`w-full text-left px-3 py-2 rounded-lg transition-all ${
+                              selectedSessionId === session.id
+                                ? 'bg-white border border-gray-100 shadow-sm'
+                                : 'hover:bg-white/60 border border-transparent'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2 mb-1">
+                              <div className={`text-sm font-medium min-w-0 ${selectedSessionId === session.id ? 'text-blue-600' : 'text-gray-700'} truncate`}>
+                                {getSessionDisplayTitle(session)}
+                              </div>
+                              <button
+                                type="button"
+                                title="hide"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  hideSession(session);
+                                }}
+                                className="p-1 -mr-1 text-gray-400 hover:text-gray-600 transition-colors shrink-0"
+                              >
+                                <EyeOff size={14} />
+                              </button>
+                            </div>
+                            <div className="text-[10px] text-gray-400 font-mono break-all">{session.id}</div>
+                            <div className="text-[10px] text-gray-400">{formatSessionDateTime(session.mtime)}</div>
+                          </button>
+                        </div>
                       ))}
                       </div>
                     </div>
@@ -1356,50 +1787,75 @@ function App() {
       <main className="flex-1 flex flex-col min-w-0 bg-white">
         {selectedSessionId ? (
           <>
-            <header className="min-h-16 py-2 border-b border-gray-100 px-8 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 shrink-0 bg-white/80 backdrop-blur-sm sticky top-0 z-10">
-              <div className="min-w-0 pr-2">
-                <div className="flex flex-col min-w-0">
-                  <div className="text-sm font-semibold text-gray-900 flex items-start gap-2 min-w-0 mb-1" title={selectedProjectName}>
-                    <Folder size={16} className="text-gray-400 shrink-0 mt-0.5" />
-                    <span className="block w-full min-w-0 break-all overflow-hidden">{selectedProjectName}</span>
-                  </div>
-                  <div className="text-sm font-semibold text-gray-900 flex items-center gap-2">
-                    <History size={16} className="text-gray-400" />
-                    Session: {getSessionDisplayTitle(selectedSession) || selectedSessionId}
-                  </div>
-                  {getSessionSlugNameLabel(selectedSession) ? (
-                    <div className="text-[11px] text-gray-500 mt-0.5">{getSessionSlugNameLabel(selectedSession)}</div>
-                  ) : null}
+            <header className="py-2 border-b border-gray-100 px-8 flex flex-col gap-1.5 shrink-0 bg-white/80 backdrop-blur-sm sticky top-0 z-10">
+              <div className="flex items-center justify-between gap-4 min-w-0">
+                <div className="min-w-0 flex items-center gap-2 text-sm leading-none">
                   {selectedSession?.mtime ? (
-                    <div className="text-sm font-semibold text-gray-900 flex items-center gap-2 mt-1">
-                      <Clock size={16} className="text-gray-400" />
-                      {formatSessionDateTime(selectedSession.mtime)}
-                    </div>
+                    <>
+                      <Clock size={14} className="text-gray-400 shrink-0" />
+                      <span className="inline-flex items-center text-xs text-gray-500 whitespace-nowrap leading-none">
+                        {formatSessionDateTime(selectedSession.mtime)}
+                      </span>
+                    </>
                   ) : null}
-                </div>
-              </div>
-              <div className="flex items-center gap-4 shrink-0">
-                <div className="flex items-center gap-1 text-xs text-gray-500 bg-gray-100 px-2.5 py-1.5 rounded-full font-medium">
-                  <Cpu size={14} /> Total Events: {events.length}
-                </div>
-                {analysisProgress ? (
-                  <div className="flex items-center gap-2 text-xs font-semibold text-blue-600 animate-pulse">
-                    <Clock size={14} /> {analysisProgress}
+                  <History size={14} className="text-gray-400 shrink-0" />
+                  <span className="relative -top-px inline-flex items-center font-semibold text-gray-900 truncate leading-none">
+                    Session: {getSessionDisplayTitle(selectedSession) || selectedSessionId}
+                  </span>
+                  <div className="relative shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setShowSessionMeta(prev => !prev)}
+                      className="inline-flex items-center justify-center text-gray-400 hover:text-gray-600 transition-colors"
+                      aria-label="Session metadata"
+                    >
+                      <Info size={14} />
+                    </button>
+                    {showSessionMeta ? (
+                      <div className="absolute left-0 top-full mt-1 rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500 shadow-md whitespace-nowrap z-20">
+                        {[`session id: ${selectedSessionId}`, selectedSession?.slug ? `slug: ${selectedSession.slug}` : ''].filter(Boolean).join(' · ')}
+                      </div>
+                    ) : null}
                   </div>
-                ) : (
-                  <button 
-                    onClick={triggerAnalysis}
-                    className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-full text-xs font-bold transition-all shadow-md shadow-blue-100 active:scale-95"
-                  >
-                    <Activity size={14} /> {analysis ? 'Re-Analyze Session' : 'Analyze Session'}
-                  </button>
-                )}
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <div className="flex items-center gap-1 text-xs text-gray-600 bg-gray-100 px-2.5 py-1 rounded-full font-medium">
+                    <Cpu size={14} />
+                    {eventCounts.withSubagents.toLocaleString()} Events
+                    <span className="text-gray-500">({eventCounts.withoutSubagents.toLocaleString()} main)</span>
+                  </div>
+                  {analysisProgress ? (
+                    <div className="flex items-center gap-2 text-xs font-semibold text-blue-600 animate-pulse">
+                      <Clock size={14} /> {analysisProgress}
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={triggerAnalysis}
+                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-full text-xs font-bold transition-all shadow-md shadow-blue-100 active:scale-95"
+                    >
+                      <Activity size={14} /> {analysis ? 'Re-Analyze Session' : 'Analyze Session'}
+                    </button>
+                  )}
+                </div>
               </div>
-              </header>
+              <div className="flex items-center gap-2 min-w-0 text-sm text-gray-700" title={selectedProjectPath}>
+                <Folder size={15} className="text-gray-400 shrink-0" />
+                <span className="truncate bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md">{selectedProjectPathShort}</span>
+                <button
+                  type="button"
+                  onClick={copyProjectPath}
+                  className="text-gray-400 hover:text-gray-600 transition-colors shrink-0"
+                  title={projectPathCopyState === 'copied' ? 'Copied' : projectPathCopyState === 'error' ? 'Copy failed' : 'Copy full path'}
+                  aria-label="Copy full project path"
+                >
+                  {projectPathCopyState === 'copied' ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              </div>
+            </header>
 
               <div className="flex-1 flex min-h-0">
-              <div className="flex-1 overflow-y-auto px-8 py-12 scroll-smooth">
-                <div className="max-w-4xl mx-auto">
+              <div ref={mainContentScrollRef} className="flex-1 overflow-y-auto px-8 pb-12 scroll-smooth">
+                <div className="max-w-4xl mx-auto pt-12">
                   {loading ? (
                     <div className="flex flex-col items-center justify-center h-64 text-gray-400 gap-4">
                       <Clock size={32} className="animate-spin text-blue-500" />
@@ -1510,14 +1966,29 @@ function App() {
             </div>
           </>
         ) : (
-          <div className="flex-1 overflow-y-auto px-8 py-10 bg-gray-50/30">
+          <div className="flex-1 overflow-y-scroll px-8 py-10 bg-gray-50/30 [scrollbar-gutter:stable]">
             <div className="max-w-5xl mx-auto">
-              <div className="mb-6">
-                <h2 className="text-xl font-bold text-gray-900">Projects</h2>
-                <p className="text-sm text-gray-500">Select a session from any project to begin inspection.</p>
+              <div className="mb-6 flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-bold text-gray-900">
+                    {showHiddenOnMain ? 'Hidden Sessions' : 'Projects'}
+                  </h2>
+                  <p className="text-sm text-gray-500">
+                    {showHiddenOnMain
+                      ? 'Showing hidden sessions grouped by project.'
+                      : 'Select a session from any project to begin inspection.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowHiddenOnMain(prev => !prev)}
+                  className="mt-1 px-2 py-1 text-xs font-medium text-gray-600 hover:text-gray-800 rounded-md hover:bg-gray-100 transition-colors"
+                >
+                  {showHiddenOnMain ? 'Show regular' : 'Show hidden'}
+                </button>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {projects.map(project => (
+                {(showHiddenOnMain ? hiddenProjects : visibleProjects).map(project => (
                   <div key={`landing-${project.id}`} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
                     <div
                       className="text-sm font-semibold text-gray-900 mb-3 block min-w-0 overflow-hidden whitespace-nowrap"
@@ -1528,18 +1999,45 @@ function App() {
                     <div className="border-t border-gray-200 mb-2"></div>
                     <div className="space-y-1 max-h-56 overflow-y-auto">
                       {project.sessions.map(session => (
-                        <button
-                          key={`landing-session-${project.id}-${session.id}`}
-                          onClick={() => selectSession(session.id, project.id)}
-                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-50 border border-transparent hover:border-gray-100"
-                        >
-                          <div className="text-sm font-medium text-gray-700 truncate">{getSessionDisplayTitle(session)}</div>
-                          {getSessionSlugNameLabel(session) ? (
-                            <div className="text-[10px] text-gray-500 truncate">{getSessionSlugNameLabel(session)}</div>
-                          ) : null}
-                          <div className="text-[10px] text-gray-400 font-mono truncate">{session.id}</div>
-                          <div className="text-[10px] text-gray-400">{formatSessionDateTime(session.mtime)}</div>
-                        </button>
+                        <div key={`landing-session-${project.id}-${session.id}`} className="relative group">
+                          <button
+                            onClick={() => selectSession(session.id, project.id)}
+                            className="w-full text-left px-3 py-2 pr-9 rounded-lg hover:bg-gray-50 border border-transparent hover:border-gray-100"
+                          >
+                            <div className="text-sm font-medium text-gray-700 truncate">{getSessionDisplayTitle(session)}</div>
+                            <div className="text-[10px] text-gray-400 font-mono truncate">{session.id}</div>
+                            <div className="text-[10px] text-gray-400 flex items-center gap-2">
+                              <span>{formatSessionDateTime(session.mtime)}</span>
+                              <span className="font-mono">• {session.size_mb.toFixed(1)} MB</span>
+                            </div>
+                          </button>
+                          {!showHiddenOnMain && (
+                            <button
+                              type="button"
+                              title="hide"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                hideSession(session);
+                              }}
+                              className="absolute top-2 right-2 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                            >
+                              <EyeOff size={14} />
+                            </button>
+                          )}
+                          {showHiddenOnMain && (
+                            <button
+                              type="button"
+                              title="unhide"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                unhideSession(session.id);
+                              }}
+                              className="absolute top-2 right-2 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                            >
+                              <Eye size={14} />
+                            </button>
+                          )}
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -1553,6 +2051,23 @@ function App() {
             agentId={activeSubagentId} 
             onClose={() => setActiveSubagentId(null)} 
           />
+        )}
+        {hideToast && (
+          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 w-[320px] rounded-lg border border-gray-200 bg-white shadow-lg">
+            <button
+              type="button"
+              onClick={undoHide}
+              className="w-full px-3 py-2 text-xs text-left text-gray-700 hover:text-gray-900"
+            >
+              Undo hide: {trimText(hideToast.label, 38)}
+            </button>
+            <div className="h-1 bg-gray-100 rounded-b-lg overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-[width] duration-75"
+                style={{ width: `${hideToastProgress}%` }}
+              />
+            </div>
+          </div>
         )}
       </main>
     </div>

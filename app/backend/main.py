@@ -78,6 +78,25 @@ def save_index_state(state: Dict[str, Any]) -> None:
     INDEX_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     INDEX_STATE_PATH.write_text(json.dumps(safe_state, indent=2))
 
+def extract_renamed_session_title(data: Dict[str, Any]) -> Optional[str]:
+    if data.get("type") == "custom-title" and data.get("customTitle"):
+        return str(data.get("customTitle"))
+
+    if data.get("type") == "rename":
+        for key in ("customTitle", "title", "name", "newTitle"):
+            value = data.get(key)
+            if value:
+                return str(value)
+
+    rename_payload = data.get("rename")
+    if isinstance(rename_payload, dict):
+        for key in ("customTitle", "title", "name", "newTitle"):
+            value = rename_payload.get(key)
+            if value:
+                return str(value)
+
+    return None
+
 def extract_session_metadata(session_file: Path) -> Dict[str, Any]:
     title = session_file.stem
     cwd_path: Optional[str] = None
@@ -102,13 +121,11 @@ def extract_session_metadata(session_file: Path) -> Dict[str, Any]:
                     cwd_path = str(data.get("cwd"))
 
                 if isinstance(data, dict):
-                    if data.get("type") == "custom-title" and data.get("customTitle"):
-                        custom_title = str(data.get("customTitle"))
+                    renamed_title = extract_renamed_session_title(data)
+                    if renamed_title:
+                        custom_title = renamed_title
                     elif not slug_title and data.get("slug"):
                         slug_title = str(data.get("slug"))
-
-                if cwd_path and custom_title:
-                    break
     except Exception:
         logger.warning("Could not parse metadata for session file %s", session_file)
 
@@ -277,6 +294,14 @@ def mark_recent_session(session_id: str) -> None:
     recent_ids = [sid for sid in state.get("recent_session_ids", []) if sid != session_id]
     recent_ids.insert(0, session_id)
     state["recent_session_ids"] = recent_ids[:MAX_RECENT_SESSIONS]
+    save_index_state(state)
+
+def remove_recent_session(session_id: str) -> None:
+    state = load_index_state()
+    state["recent_session_ids"] = [
+        sid for sid in state.get("recent_session_ids", [])
+        if sid != session_id
+    ]
     save_index_state(state)
 
 def validate_agent_id(agent_id: str) -> str:
@@ -733,6 +758,12 @@ def touch_recent_session(session_id: str):
     get_session_record(session_id)
     mark_recent_session(session_id)
     return {"message": "Recent session updated"}
+
+@app.post("/api/session/{session_id}/recent/remove")
+def delete_recent_session(session_id: str):
+    get_session_record(session_id)
+    remove_recent_session(session_id)
+    return {"message": "Recent session removed"}
 
 @app.get("/api/session/{session_id}")
 def get_session(session_id: str, include_subagents: bool = False):
