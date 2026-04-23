@@ -136,6 +136,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [analysisProgress, setAnalysisProgress] = useState<string | null>(null);
+  const [sessionFilesStatus, setSessionFilesStatus] = useState<string | null>(null);
   const [subagentLogs, setSubagentLogs] = useState<Record<string, Event[]>>({});
   const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
   const [showSessionMeta, setShowSessionMeta] = useState(false);
@@ -230,6 +231,7 @@ function App() {
       setLoading(true);
       setAnalysis(null);
       setAnalysisProgress(null);
+      setSessionFilesStatus(null);
       setEventCounts({ withSubagents: 0, withoutSubagents: 0 });
 
       const controller = new AbortController();
@@ -376,6 +378,25 @@ function App() {
         analysisEventSourceRef.current = null;
       }
     };
+  };
+
+  const createSessionFilesOnly = async () => {
+    if (!selectedSessionId) return;
+    const sessionId = selectedSessionId;
+    setSessionFilesStatus('Creating session files...');
+    try {
+      const response = await fetch(`/api/session/${sessionId}/session-files`, { method: 'POST' });
+      if (!response.ok) {
+        setSessionFilesStatus('Error: Failed to create session files');
+        return;
+      }
+      const data = await response.json();
+      const subagentCount = Number(data?.subagent_count || 0);
+      const groupCount = Number(data?.group_count || 0);
+      setSessionFilesStatus(`Created (${subagentCount} sub-agents, ${groupCount} groups)`);
+    } catch {
+      setSessionFilesStatus('Error: Failed to create session files');
+    }
   };
 
   const updateFrameSuggestion = (frameIndex: number, newSuggestion: string) => {
@@ -1246,12 +1267,7 @@ function App() {
     if (!content) return null;
 
     if (typeof content === 'string') {
-      let cleaned = content
-        .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '')
-        .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, '')
-        .replace(/<command-name>[\s\S]*?<\/command-name>/g, '')
-        .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, '')
-        .trim();
+      let cleaned = content.trim();
 
       if (!cleaned) return null;
 
@@ -1829,15 +1845,26 @@ function App() {
                       <Clock size={14} /> {analysisProgress}
                     </div>
                   ) : (
-                    <button 
-                      onClick={triggerAnalysis}
-                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-full text-xs font-bold transition-all shadow-md shadow-blue-100 active:scale-95"
-                    >
-                      <Activity size={14} /> {analysis ? 'Re-Analyze Session' : 'Analyze Session'}
-                    </button>
+                    <>
+                      <button
+                        onClick={createSessionFilesOnly}
+                        className="flex items-center gap-2 bg-white border border-gray-300 hover:border-gray-400 text-gray-700 px-4 py-1.5 rounded-full text-xs font-semibold transition-all active:scale-95"
+                      >
+                        <FileText size={14} /> Create Session Files
+                      </button>
+                      <button 
+                        onClick={triggerAnalysis}
+                        className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-full text-xs font-bold transition-all shadow-md shadow-blue-100 active:scale-95"
+                      >
+                        <Activity size={14} /> {analysis ? 'Re-Analyze Session' : 'Analyze Session'}
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
+              {sessionFilesStatus ? (
+                <div className="text-xs text-gray-500">{sessionFilesStatus}</div>
+              ) : null}
               <div className="flex items-center gap-2 min-w-0 text-sm text-gray-700" title={selectedProjectPath}>
                 <Folder size={15} className="text-gray-400 shrink-0" />
                 <span className="truncate bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md">{selectedProjectPathShort}</span>

@@ -3,9 +3,10 @@ import os
 import logging
 import asyncio
 import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Dict, Any, AsyncGenerator
+from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple, Set
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -36,12 +37,30 @@ app.add_middleware(
 
 DATA_ROOT = Path("/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/aradz_shared/loader/junk/claude_inspect")
 CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
-INDEX_STATE_PATH = Path(__file__).parent / "session_index.json"
+DB_ROOT = Path(__file__).parent / "db"
+INDEX_STATE_PATH = DB_ROOT / "session_index.json"
 MAX_JSONL_SCAN_LINES = 400
 MAX_RECENT_SESSIONS = 20
 PROMPTS_ROOT = Path(__file__).parent / "prompts"
+GENERATED_SESSIONS_ROOT = DB_ROOT / "generated_sessions"
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 AGENT_ID_PATTERN = re.compile(r"^[a-f0-9]+$")
+LOCAL_COMMAND_CAVEAT_PATTERN = re.compile(
+    r"<local-command-caveat>[\s\S]*?</local-command-caveat>",
+    re.IGNORECASE,
+)
+TASK_NOTIFICATION_PATTERN = re.compile(
+    r"<task-notification>[\s\S]*?</task-notification>",
+    re.IGNORECASE,
+)
+COMMAND_NAME_PATTERN = re.compile(
+    r"<command-name>[\s\S]*?</command-name>",
+    re.IGNORECASE,
+)
+LOCAL_COMMAND_STDOUT_PATTERN = re.compile(
+    r"<local-command-stdout>[\s\S]*?</local-command-stdout>",
+    re.IGNORECASE,
+)
 
 # Track background analysis status
 analysis_status: Dict[str, str] = {}
@@ -317,14 +336,18 @@ def resolve_session_file_path(session_id: str) -> Path:
     session_record = get_session_record(session_id)
     return Path(str(session_record["session_file_path"]))
 
+def resolve_generated_session_dir(session_id: str) -> Path:
+    validate_session_id(session_id)
+    return GENERATED_SESSIONS_ROOT / session_id
+
 def get_analysis_status_path(session_id: str) -> Path:
-    return resolve_session_dir(session_id) / "analysis_status.json"
+    return resolve_generated_session_dir(session_id) / "analysis_status.json"
 
 def set_analysis_status(session_id: str, status: str) -> None:
     analysis_status[session_id] = status
     try:
         status_path = get_analysis_status_path(session_id)
-        status_path.parent.mkdir(exist_ok=True)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
         status_path.write_text(json.dumps({"status": status}))
     except Exception:
         logger.warning("Could not persist analysis status for %s", session_id)
@@ -340,88 +363,723 @@ def get_analysis_status(session_id: str) -> str:
         logger.warning("Could not read persisted analysis status for %s", session_id)
     return "Not started"
 
-async def run_claude_analysis(session_id: str):
-    """Async task to run framing analysis."""
+def sanitize_bucket_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    return cleaned or "unknown"
+
+def first_word(value: str) -> str:
+    match = re.search(r"[A-Za-z0-9._-]+", value or "")
+    if match:
+        return match.group(0)
+    return "unknown"
+
+def get_tool_use_parts(message: Any) -> List[Dict[str, Any]]:
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content", [])
+    parts = content if isinstance(content, list) else [content]
+    return [part for part in parts if isinstance(part, dict) and part.get("type") == "tool_use"]
+
+def get_tool_result_parts(event: Dict[str, Any]) -> List[Tuple[Optional[str], str]]:
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content", [])
+    parts = content if isinstance(content, list) else [content]
+    tool_results: List[Tuple[Optional[str], str]] = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "tool_result":
+            continue
+        tool_results.append((part.get("tool_use_id"), get_content_text(part.get("content", part))))
+    if tool_results:
+        return tool_results
+    return [(None, get_content_text(content))]
+
+def normalize_generated_text(value: Any) -> str:
+    text = get_content_text(value)
+    text = text.strip()
+    if text == "{}":
+        return ""
+    return text
+
+def sanitize_markup_text(text: str) -> str:
+    text = LOCAL_COMMAND_CAVEAT_PATTERN.sub("", text)
+    text = TASK_NOTIFICATION_PATTERN.sub("", text)
+    text = COMMAND_NAME_PATTERN.sub("", text)
+    text = LOCAL_COMMAND_STDOUT_PATTERN.sub("", text)
+    return text
+
+def sanitize_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_markup_text(value)
+    if isinstance(value, list):
+        return [sanitize_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_payload(item) for key, item in value.items()}
+    return value
+
+def extract_subagent_invocation_fields(tool_input: Any) -> Tuple[str, str]:
+    if isinstance(tool_input, dict):
+        description = normalize_generated_text(tool_input.get("description", ""))
+        prompt = normalize_generated_text(
+            tool_input.get("prompt", tool_input.get("task", tool_input.get("input", "")))
+        )
+        return description, prompt
+
+    raw = normalize_generated_text(tool_input)
+    if not raw:
+        return "", ""
     try:
-        session_dir = resolve_session_dir(session_id)
-        session_dir.mkdir(exist_ok=True)
-        
-        set_analysis_status(session_id, "Exporting session...")
-        # 1. Export Minimal JSON
-        events = get_session(session_id)
-        minimal_events = []
-        for e in events:
-            role = e.get("role_type", "unknown")
-            text = get_content_text(e.get("message", e.get("attachment", e.get("content", ""))))
-            minimal_events.append({
-                "uuid": e.get("uuid"),
-                "role": role,
-                "text": text,
-                "tokens": e.get("total_tokens", 0)
-            })
-            
-            # Include sub-agent events if applicable
-            if e.get("subagent_id"):
-                agent_id = e["subagent_id"]
+        parsed = json.loads(raw)
+    except Exception:
+        return "", raw
+    if not isinstance(parsed, dict):
+        return "", raw
+    description = normalize_generated_text(parsed.get("description", ""))
+    prompt = normalize_generated_text(
+        parsed.get("prompt", parsed.get("task", parsed.get("input", "")))
+    )
+    if description or prompt:
+        return description, prompt
+    return "", raw
+
+def extract_subagent_metadata_from_main_events(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    metadata_by_agent_id: Dict[str, Dict[str, str]] = {}
+    for event in events:
+        if event.get("role_type") != "assistant":
+            continue
+        for part in get_tool_use_parts(event.get("message")):
+            if str(part.get("name", "")).lower() != "agent":
+                continue
+            agent_id = part.get("subagent_id")
+            if not agent_id:
+                continue
+            tool_input = part.get("input", {})
+            agent_type = "unknown"
+            description = "Unknown agent"
+            if isinstance(tool_input, dict):
+                raw_type = tool_input.get("agentType") or tool_input.get("agent_type")
+                raw_description = tool_input.get("description")
+                if raw_type:
+                    agent_type = str(raw_type)
+                if raw_description:
+                    description = str(raw_description)
+            metadata_by_agent_id[str(agent_id)] = {
+                "agentType": agent_type,
+                "description": description,
+            }
+    return metadata_by_agent_id
+
+def read_subagent_meta_file(meta_path: Path) -> Optional[Dict[str, str]]:
+    if not meta_path.exists():
+        return None
+    try:
+        data = json.loads(meta_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    agent_type = str(data.get("agentType") or data.get("agent_type") or "unknown")
+    description = str(data.get("description") or "Unknown agent")
+    return {"agentType": agent_type, "description": description}
+
+def build_main_minimal_session(
+    session_id: str,
+    events: List[Dict[str, Any]],
+    metadata_by_agent_id: Dict[str, Dict[str, str]],
+) -> Dict[str, Any]:
+    messages: List[Dict[str, Any]] = []
+    idx = 0
+    agent_tool_call_ids: Set[str] = set()
+
+    for event in events:
+        role_type = event.get("role_type")
+        if role_type not in {"system", "user", "assistant", "tool"}:
+            continue
+
+        if role_type == "assistant":
+            message = event.get("message")
+            content = message.get("content", []) if isinstance(message, dict) else []
+            parts = content if isinstance(content, list) else [content]
+            text_chunks: List[str] = []
+            tool_calls: List[Dict[str, Any]] = []
+            invocation_messages: List[Dict[str, Any]] = []
+
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_chunks.append(str(part.get("text", "")))
+                elif isinstance(part, dict) and part.get("type") == "tool_use":
+                    tool_name = str(part.get("name", ""))
+                    tool_id = str(part.get("id", ""))
+                    tool_input = part.get("input", {})
+                    if tool_name.lower() == "agent" and part.get("subagent_id"):
+                        if tool_id:
+                            agent_tool_call_ids.add(tool_id)
+                        agent_id = str(part.get("subagent_id"))
+                        meta = metadata_by_agent_id.get(
+                            agent_id,
+                            {"agentType": "unknown", "description": "Unknown agent"},
+                        )
+                        description, prompt = extract_subagent_invocation_fields(tool_input)
+                        output_summary = normalize_generated_text(part.get("output", ""))
+                        invocation_message: Dict[str, Any] = {
+                            "idx": -1,
+                            "role": "sub_agent_invocation",
+                            "agent_type": meta["agentType"],
+                            "conversation_id": agent_id,
+                        }
+                        if description:
+                            invocation_message["description"] = description
+                        if prompt:
+                            invocation_message["prompt"] = prompt
+                        if output_summary:
+                            invocation_message["output_summary"] = output_summary
+                        if (
+                            "description" in invocation_message
+                            or "prompt" in invocation_message
+                            or "output_summary" in invocation_message
+                        ):
+                            invocation_messages.append(invocation_message)
+                    else:
+                        call_entry: Dict[str, Any] = {"name": tool_name, "input": tool_input}
+                        output_text = normalize_generated_text(part.get("output", ""))
+                        if output_text:
+                            call_entry["output"] = output_text
+                        tool_calls.append(call_entry)
+
+            assistant_message: Dict[str, Any] = {"idx": idx, "role": "assistant"}
+            assistant_content = "\n\n".join(chunk for chunk in text_chunks if chunk).strip()
+            assistant_content = normalize_generated_text(assistant_content)
+            if assistant_content and not tool_calls:
+                assistant_message["content"] = assistant_content
+            if tool_calls:
+                assistant_message["tool_calls"] = tool_calls
+            if assistant_message.get("content") or assistant_message.get("tool_calls"):
+                messages.append(assistant_message)
+                idx += 1
+            for invocation_message in invocation_messages:
+                invocation_message["idx"] = idx
+                messages.append(invocation_message)
+                idx += 1
+            continue
+
+        if role_type == "tool":
+            for tool_call_id, content in get_tool_result_parts(event):
+                if tool_call_id and tool_call_id in agent_tool_call_ids:
+                    continue
+                clean_content = normalize_generated_text(content)
+                if not clean_content:
+                    continue
+                tool_message: Dict[str, Any] = {
+                    "idx": idx,
+                    "role": "tool_result",
+                    "content": clean_content,
+                }
+                if tool_call_id:
+                    tool_message["tool_call_id"] = tool_call_id
+                messages.append(tool_message)
+                idx += 1
+            continue
+
+        message = event.get("message", {})
+        content = normalize_generated_text(message.get("content", message))
+        if not content:
+            continue
+        messages.append({
+            "idx": idx,
+            "role": "system" if role_type == "system" else "user",
+            "content": content,
+        })
+        idx += 1
+
+    return {
+        "conversation_id": session_id,
+        "agent_type": "main",
+        "messages": messages,
+    }
+
+def build_subagent_minimal_session(
+    agent_id: str,
+    agent_type: str,
+    events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    messages: List[Dict[str, Any]] = []
+    idx = 0
+
+    for event in events:
+        role_type = event.get("role_type")
+        if role_type not in {"system", "user", "assistant", "tool"}:
+            continue
+
+        if role_type == "assistant":
+            message = event.get("message")
+            content = message.get("content", []) if isinstance(message, dict) else []
+            parts = content if isinstance(content, list) else [content]
+            text_chunks: List[str] = []
+            tool_calls: List[Dict[str, Any]] = []
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_chunks.append(str(part.get("text", "")))
+                elif isinstance(part, dict) and part.get("type") == "tool_use":
+                    call_entry: Dict[str, Any] = {
+                        "name": str(part.get("name", "")),
+                        "input": part.get("input", {}),
+                    }
+                    output_text = normalize_generated_text(part.get("output", ""))
+                    if output_text:
+                        call_entry["output"] = output_text
+                    tool_calls.append(call_entry)
+
+            assistant_message: Dict[str, Any] = {"idx": idx, "role": "assistant"}
+            assistant_content = "\n\n".join(chunk for chunk in text_chunks if chunk).strip()
+            assistant_content = normalize_generated_text(assistant_content)
+            if assistant_content and not tool_calls:
+                assistant_message["content"] = assistant_content
+            if tool_calls:
+                assistant_message["tool_calls"] = tool_calls
+            if assistant_message.get("content") or assistant_message.get("tool_calls"):
+                messages.append(assistant_message)
+                idx += 1
+            continue
+
+        if role_type == "tool":
+            for tool_call_id, content in get_tool_result_parts(event):
+                clean_content = normalize_generated_text(content)
+                if not clean_content:
+                    continue
+                tool_message: Dict[str, Any] = {
+                    "idx": idx,
+                    "role": "tool_result",
+                    "content": clean_content,
+                }
+                if tool_call_id:
+                    tool_message["tool_call_id"] = tool_call_id
+                messages.append(tool_message)
+                idx += 1
+            continue
+
+        message = event.get("message", {})
+        content = normalize_generated_text(message.get("content", message))
+        if not content:
+            continue
+        messages.append({
+            "idx": idx,
+            "role": "system" if role_type == "system" else "user",
+            "content": content,
+        })
+        idx += 1
+
+    return {
+        "conversation_id": agent_id,
+        "agent_type": agent_type,
+        "messages": messages,
+    }
+
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2))
+
+def path_for_prompt(path: Path, working_dir: Optional[Path] = None) -> str:
+    resolved = path.resolve()
+    if working_dir is None:
+        return str(resolved)
+    try:
+        return str(resolved.relative_to(working_dir.resolve()))
+    except ValueError:
+        return str(resolved)
+
+def resolve_manifest_path(path_str: str, generated_dir: Path) -> Path:
+    candidate = Path(path_str)
+    if candidate.is_absolute():
+        return candidate
+    return (generated_dir / candidate).resolve()
+
+def estimate_message_tokens(message: Dict[str, Any]) -> int:
+    role = message.get("role")
+    total = 0
+    if role in {"system", "user", "assistant", "tool_result"}:
+        total += estimate_tokens(get_content_text(message.get("content", "")))
+    if role == "assistant":
+        for call in message.get("tool_calls", []) or []:
+            if isinstance(call, dict):
+                total += estimate_tokens(get_content_text(call.get("input", {})))
+                total += estimate_tokens(get_content_text(call.get("name", "")))
+    if role == "sub_agent_invocation":
+        total += estimate_tokens(get_content_text(message.get("input", "")))
+        total += estimate_tokens(get_content_text(message.get("output_summary", "")))
+        total += estimate_tokens(get_content_text(message.get("agent_type", "")))
+    return total
+
+def build_token_index_for_session(session_path: Path) -> Dict[int, int]:
+    data = json.loads(session_path.read_text())
+    messages = data.get("messages", [])
+    token_index: Dict[int, int] = {}
+    if not isinstance(messages, list):
+        return token_index
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        idx = message.get("idx")
+        if isinstance(idx, int):
+            token_index[idx] = estimate_message_tokens(message)
+    return token_index
+
+def token_sum_for_ranges(token_index: Dict[int, int], ranges: List[Tuple[int, int]]) -> int:
+    covered_indices: Set[int] = set()
+    for start, end in ranges:
+        lo = min(start, end)
+        hi = max(start, end)
+        covered_indices.update(range(lo, hi + 1))
+    return sum(token_index.get(idx, 0) for idx in covered_indices)
+
+def add_token_estimation_to_conversation_analysis(
+    analysis_path: Path,
+    session_path: Path,
+) -> None:
+    if not analysis_path.exists() or not session_path.exists():
+        return
+
+    analysis = json.loads(analysis_path.read_text())
+    if not isinstance(analysis, dict):
+        return
+
+    friction_ranges: Dict[str, Tuple[int, int]] = {}
+    for frame in analysis.get("frames", []) or []:
+        if not isinstance(frame, dict):
+            continue
+        for point in frame.get("friction_points", []) or []:
+            if not isinstance(point, dict):
+                continue
+            pid = point.get("id")
+            rng = point.get("message_range")
+            if isinstance(pid, str) and isinstance(rng, list) and len(rng) == 2:
                 try:
-                    agent_events = get_subagent(session_id, agent_id)
-                    for ae in agent_events:
-                        minimal_events.append({
-                            "uuid": ae.get("uuid"),
-                            "role": f"subagent-{agent_id}-{ae.get('role_type')}",
-                            "text": get_content_text(ae.get("message", ae.get("attachment", ae.get("content", "")))),
-                            "tokens": ae.get("total_tokens", 0),
-                            "parent_uuid": e.get("uuid")
-                        })
-                except:
-                    logger.warning(f"Could not fetch subagent {agent_id} for analysis")
+                    friction_ranges[pid] = (int(rng[0]), int(rng[1]))
+                except Exception:
+                    continue
 
-        export_path = session_dir / "minimal_session.json"
-        with open(export_path, "w") as f:
-            json.dump(minimal_events, f)
+    token_index = build_token_index_for_session(session_path)
+    for suggestion in analysis.get("suggestions", []) or []:
+        if not isinstance(suggestion, dict):
+            continue
+        addresses = suggestion.get("addresses", [])
+        ranges: List[Tuple[int, int]] = []
+        if isinstance(addresses, list):
+            for address in addresses:
+                if isinstance(address, str) and address in friction_ranges:
+                    ranges.append(friction_ranges[address])
+        suggestion["token_estimation_save"] = token_sum_for_ranges(token_index, ranges)
 
-        set_analysis_status(session_id, "Framing conversation...")
-        # 2. Framing
-        frame_prompt_path = (PROMPTS_ROOT / "frame.md").resolve()
-        if not frame_prompt_path.exists():
-            raise Exception(f"Framing prompt not found: {frame_prompt_path}")
+    write_json(analysis_path, analysis)
 
-        framing_instruction = (
-            f"Follow the markdown instructions in @{frame_prompt_path}. "
-            f"The input is in @{export_path.resolve()}. "
-            "Return only valid JSON."
-        )
-        process = await asyncio.create_subprocess_exec(
-            "claude", "-p", framing_instruction,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+def add_token_estimation_to_subagent_analysis(
+    analysis_path: Path,
+    session_paths: List[Path],
+) -> None:
+    if not analysis_path.exists():
+        return
+
+    analysis = json.loads(analysis_path.read_text())
+    if not isinstance(analysis, dict):
+        return
+
+    token_index_by_conversation_id: Dict[str, Dict[int, int]] = {}
+    for session_path in session_paths:
+        if not session_path.exists():
+            continue
+        data = json.loads(session_path.read_text())
+        if not isinstance(data, dict):
+            continue
+        conversation_id = data.get("conversation_id")
+        if isinstance(conversation_id, str):
+            token_index_by_conversation_id[conversation_id] = build_token_index_for_session(session_path)
+
+    action_occurrences: Dict[str, List[Tuple[str, int, int]]] = {}
+    for action in analysis.get("shared_preamble_actions", []) or []:
+        if not isinstance(action, dict):
+            continue
+        action_id = action.get("id")
+        if not isinstance(action_id, str):
+            continue
+        entries: List[Tuple[str, int, int]] = []
+        for appeared in action.get("appeared_in", []) or []:
+            if not isinstance(appeared, dict):
+                continue
+            cid = appeared.get("conversation_id")
+            rng = appeared.get("message_range")
+            if isinstance(cid, str) and isinstance(rng, list) and len(rng) == 2:
+                try:
+                    entries.append((cid, int(rng[0]), int(rng[1])))
+                except Exception:
+                    continue
+        action_occurrences[action_id] = entries
+
+    for suggestion in analysis.get("suggestions", []) or []:
+        if not isinstance(suggestion, dict):
+            continue
+        total = 0
+        addresses = suggestion.get("addresses", [])
+        if isinstance(addresses, list):
+            for address in addresses:
+                if not isinstance(address, str):
+                    continue
+                for cid, start, end in action_occurrences.get(address, []):
+                    token_index = token_index_by_conversation_id.get(cid, {})
+                    total += token_sum_for_ranges(token_index, [(start, end)])
+        suggestion["token_estimation_save"] = total
+
+    write_json(analysis_path, analysis)
+
+def create_session_files(session_id: str) -> Dict[str, Any]:
+    validate_session_id(session_id)
+    generated_dir = resolve_generated_session_dir(session_id)
+    source_session_dir = resolve_session_dir(session_id)
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    stale_manifest = generated_dir / "session_manifest.json"
+    if stale_manifest.exists():
+        stale_manifest.unlink()
+    stale_subagents_dir = generated_dir / "subagents"
+    if stale_subagents_dir.exists():
+        for stale_meta in stale_subagents_dir.glob("*.meta.json"):
+            stale_meta.unlink()
+
+    main_events = get_session(session_id, include_subagents=False)
+    metadata_by_agent_id = extract_subagent_metadata_from_main_events(main_events)
+    main_session = build_main_minimal_session(session_id, main_events, metadata_by_agent_id)
+    main_session_path = generated_dir / "main.session.json"
+    write_json(main_session_path, main_session)
+
+    subagent_ids = {
+        agent_id for agent_id in metadata_by_agent_id.keys()
+        if AGENT_ID_PATTERN.fullmatch(agent_id)
+    }
+    for event in main_events:
+        raw_agent_id = event.get("subagent_id")
+        if isinstance(raw_agent_id, str) and AGENT_ID_PATTERN.fullmatch(raw_agent_id):
+            subagent_ids.add(raw_agent_id)
+    sorted_subagent_ids = sorted(subagent_ids)
+    subagent_entries: List[Dict[str, Any]] = []
+    groups: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"sessions": [], "conversation_ids": []})
+
+    for agent_id in sorted_subagent_ids:
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.communicate()
-            raise Exception("Framing timed out after 300 seconds") from exc
-        if process.returncode != 0:
-            raise Exception(f"Framing failed: {stderr.decode()}")
+            subagent_events = get_subagent(session_id, agent_id)
+        except HTTPException:
+            logger.warning("Skipping sub-agent %s in session %s (events unavailable)", agent_id, session_id)
+            continue
 
-        frames = json.loads(stdout.decode())
-        for frame in frames:
-            suggestions = frame.get("suggestions", [])
-            if isinstance(suggestions, list):
-                frame["suggestion"] = "\n".join(
-                    s for s in suggestions if isinstance(s, str)
-                )
-            elif isinstance(suggestions, str):
-                frame["suggestion"] = suggestions
-            else:
-                frame["suggestion"] = ""
+        source_meta_path = source_session_dir / "subagents" / f"agent-{agent_id}.meta.json"
+        fallback_meta = metadata_by_agent_id.get(agent_id, {"agentType": "unknown", "description": "Unknown agent"})
+        meta = read_subagent_meta_file(source_meta_path) or fallback_meta
+        agent_type = str(meta.get("agentType") or "unknown")
+        description = str(meta.get("description") or "Unknown agent")
+        name = first_word(description)
 
-        # 4. Save Final Analysis
-        analysis_path = session_dir / "analysis.json"
-        with open(analysis_path, "w") as f:
-            json.dump({"frames": frames}, f)
-            
+        subagent_session = build_subagent_minimal_session(agent_id, agent_type, subagent_events)
+        subagent_session_path = generated_dir / "subagents" / f"agent-{agent_id}.session.json"
+        write_json(subagent_session_path, subagent_session)
+
+        group_key = f"{agent_type}::{name}"
+        groups[group_key]["agentType"] = agent_type
+        groups[group_key]["name"] = name
+        groups[group_key]["sessions"].append(path_for_prompt(subagent_session_path, generated_dir))
+        groups[group_key]["conversation_ids"].append(agent_id)
+
+        subagent_entries.append({
+            "agent_id": agent_id,
+            "session_path": str(subagent_session_path.resolve()),
+            "agent_type": agent_type,
+            "description": description,
+            "name": name,
+            "group_key": group_key,
+        })
+
+    group_entries: List[Dict[str, Any]] = []
+    for group_key, group_data in groups.items():
+        bucket_file_name = (
+            f"{sanitize_bucket_component(str(group_data['agentType']))}"
+            f"__{sanitize_bucket_component(str(group_data['name']))}.json"
+        )
+        group_path = generated_dir / "groups" / bucket_file_name
+        group_payload = {
+            "agentType": group_data["agentType"],
+            "name": group_data["name"],
+            "groupKey": group_key,
+            "sessions": group_data["sessions"],
+            "conversationIds": group_data["conversation_ids"],
+        }
+        write_json(group_path, group_payload)
+        group_entries.append({
+            "group_key": group_key,
+            "agent_type": group_data["agentType"],
+            "name": group_data["name"],
+            "size": len(group_data["sessions"]),
+            "sessions": group_data["sessions"],
+            "conversation_ids": group_data["conversation_ids"],
+            "group_file_path": str(group_path.resolve()),
+        })
+
+    manifest = {
+        "session_id": session_id,
+        "generated_dir": str(generated_dir.resolve()),
+        "main_session_path": str(main_session_path.resolve()),
+        "subagent_count": len(subagent_entries),
+        "group_count": len(group_entries),
+        "subagents": subagent_entries,
+        "groups": group_entries,
+    }
+    return manifest
+
+async def run_claude_prompt(
+    prompt_path: Path,
+    output_path: Path,
+    input_path: Optional[Path] = None,
+    input_paths: Optional[List[Path]] = None,
+    working_dir: Optional[Path] = None,
+) -> None:
+    if input_path is None and not input_paths:
+        raise ValueError("Either input_path or input_paths must be provided")
+
+    prompt_lines = [
+        f"Follow the markdown instructions in @{prompt_path.resolve()}.",
+        f"OUTPUT_PATH = {path_for_prompt(output_path, working_dir)}",
+    ]
+    if input_path is not None:
+        prompt_lines.append(f"INPUT_PATH = {path_for_prompt(input_path, working_dir)}")
+    if input_paths:
+        prompt_lines.append(
+            "INPUT_PATHS = "
+            + json.dumps([path_for_prompt(path, working_dir) for path in input_paths], ensure_ascii=True)
+        )
+    prompt_lines.append("Write valid JSON to OUTPUT_PATH.")
+    prompt_lines.append("Return only a short completion acknowledgement.")
+    instruction = "\n".join(prompt_lines)
+
+    process = await asyncio.create_subprocess_exec(
+        "claude", "-p", instruction,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(working_dir.resolve()) if working_dir is not None else None,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise Exception(f"Prompt timed out for {prompt_path.name}") from exc
+
+    if process.returncode != 0:
+        raise Exception(
+            f"Prompt {prompt_path.name} failed: {(stderr or b'').decode(errors='replace')}"
+        )
+
+    if output_path.exists():
+        return
+
+    stdout_text = (stdout or b"").decode(errors="replace").strip()
+    if not stdout_text:
+        raise Exception(f"Prompt {prompt_path.name} did not write output file {output_path}")
+
+    try:
+        parsed = json.loads(stdout_text)
+    except json.JSONDecodeError as exc:
+        raise Exception(
+            f"Prompt {prompt_path.name} did not produce JSON and did not write output file"
+        ) from exc
+    write_json(output_path, parsed)
+
+async def run_claude_analysis(session_id: str):
+    """Create minimal session files and run analyzers in sequence, ending with finalizer."""
+    try:
+        set_analysis_status(session_id, "Creating session files...")
+        manifest = create_session_files(session_id)
+        generated_dir = resolve_generated_session_dir(session_id)
+        analyses_dir = generated_dir / "analyses"
+        analyses_dir.mkdir(parents=True, exist_ok=True)
+
+        conversation_prompt = (PROMPTS_ROOT / "conversation_analyzer.md").resolve()
+        subagent_prompt = (PROMPTS_ROOT / "subagent_analyzer.md").resolve()
+        finalizer_prompt = (PROMPTS_ROOT / "finalizer.md").resolve()
+        if not conversation_prompt.exists():
+            raise Exception(f"Missing prompt: {conversation_prompt}")
+        if not subagent_prompt.exists():
+            raise Exception(f"Missing prompt: {subagent_prompt}")
+        if not finalizer_prompt.exists():
+            raise Exception(f"Missing prompt: {finalizer_prompt}")
+
+        conversation_analysis_paths: List[str] = []
+        conversation_analysis_jobs: List[Tuple[Path, Path]] = []
+        main_session_path = Path(manifest["main_session_path"])
+        main_analysis_path = analyses_dir / "main.conversation_analysis.json"
+        set_analysis_status(session_id, "Analyzing main conversation...")
+        await run_claude_prompt(
+            prompt_path=conversation_prompt,
+            input_path=main_session_path,
+            output_path=main_analysis_path,
+            working_dir=generated_dir,
+        )
+        conversation_analysis_paths.append(str(main_analysis_path.resolve()))
+        conversation_analysis_jobs.append((main_analysis_path, main_session_path))
+
+        subagents: List[Dict[str, Any]] = manifest.get("subagents", [])
+        total_subagents = len(subagents)
+        for index, subagent in enumerate(subagents, start=1):
+            set_analysis_status(session_id, f"Analyzing sub-agent {index}/{total_subagents}...")
+            subagent_session_path = Path(subagent["session_path"])
+            subagent_analysis_path = analyses_dir / f"{subagent['agent_id']}.conversation_analysis.json"
+            await run_claude_prompt(
+                prompt_path=conversation_prompt,
+                input_path=subagent_session_path,
+                output_path=subagent_analysis_path,
+                working_dir=generated_dir,
+            )
+            conversation_analysis_paths.append(str(subagent_analysis_path.resolve()))
+            conversation_analysis_jobs.append((subagent_analysis_path, subagent_session_path))
+
+        set_analysis_status(session_id, "Estimating conversation token savings...")
+        for analysis_path, session_path in conversation_analysis_jobs:
+            add_token_estimation_to_conversation_analysis(analysis_path, session_path)
+
+        subagent_group_analysis_paths: List[str] = []
+        subagent_group_jobs: List[Tuple[Path, List[Path]]] = []
+        groups: List[Dict[str, Any]] = manifest.get("groups", [])
+        multi_groups = [group for group in groups if int(group.get("size", 0)) > 1]
+        total_groups = len(multi_groups)
+        for index, group in enumerate(multi_groups, start=1):
+            set_analysis_status(session_id, f"Analyzing sub-agent groups {index}/{total_groups}...")
+            group_output = analyses_dir / f"{sanitize_bucket_component(group['group_key'])}.subagent_analysis.json"
+            group_session_paths = [
+                resolve_manifest_path(path, generated_dir)
+                for path in group["sessions"]
+            ]
+            await run_claude_prompt(
+                prompt_path=subagent_prompt,
+                input_paths=group_session_paths,
+                output_path=group_output,
+                working_dir=generated_dir,
+            )
+            subagent_group_analysis_paths.append(str(group_output.resolve()))
+            subagent_group_jobs.append((group_output, group_session_paths))
+
+        if subagent_group_jobs:
+            set_analysis_status(session_id, "Estimating sub-agent token savings...")
+            for analysis_path, session_paths in subagent_group_jobs:
+                add_token_estimation_to_subagent_analysis(analysis_path, session_paths)
+
+        set_analysis_status(session_id, "Finalizing analysis...")
+        finalizer_inputs = [
+            Path(path)
+            for path in (conversation_analysis_paths + subagent_group_analysis_paths)
+        ]
+        final_analysis_path = generated_dir / "analysis.json"
+        await run_claude_prompt(
+            prompt_path=finalizer_prompt,
+            input_paths=finalizer_inputs,
+            output_path=final_analysis_path,
+            working_dir=generated_dir,
+        )
+
         set_analysis_status(session_id, "Completed")
         logger.info(f"Analysis completed for {session_id}")
         
@@ -441,7 +1099,7 @@ def estimate_tokens(text: str) -> int:
 
 def get_content_text(content: Any) -> str:
     if isinstance(content, str):
-        return content
+        return sanitize_markup_text(content)
     if isinstance(content, list):
         return "".join(get_content_text(item) for item in content)
     if isinstance(content, dict):
@@ -454,6 +1112,15 @@ def get_content_text(content: Any) -> str:
 
 def enrich_event(event: Dict[str, Any], session_dir: Path) -> Dict[str, Any]:
     """Calculate token usage and extract role information."""
+    if "message" in event:
+        event["message"] = sanitize_payload(event["message"])
+    if "content" in event:
+        event["content"] = sanitize_payload(event["content"])
+    if "attachment" in event:
+        event["attachment"] = sanitize_payload(event["attachment"])
+    if "toolUseResult" in event:
+        event["toolUseResult"] = sanitize_payload(event["toolUseResult"])
+
     tokens = {
         "input": 0, 
         "output": 0, 
@@ -853,6 +1520,25 @@ async def trigger_analysis(session_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_claude_analysis, session_id)
     return {"message": "Analysis started"}
 
+@app.post("/api/session/{session_id}/session-files")
+def generate_session_files(session_id: str):
+    validate_session_id(session_id)
+    try:
+        manifest = create_session_files(session_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed creating session files for %s", session_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {
+        "message": "Session files created",
+        "session_id": session_id,
+        "generated_dir": manifest.get("generated_dir"),
+        "main_session_path": manifest.get("main_session_path"),
+        "subagent_count": manifest.get("subagent_count", 0),
+        "group_count": manifest.get("group_count", 0),
+    }
+
 @app.get("/api/session/{session_id}/analysis/stream")
 async def analysis_stream(session_id: str):
     validate_session_id(session_id)
@@ -870,7 +1556,7 @@ async def analysis_stream(session_id: str):
 
 @app.get("/api/session/{session_id}/analysis")
 def get_analysis(session_id: str):
-    analysis_path = resolve_session_dir(session_id) / "analysis.json"
+    analysis_path = resolve_generated_session_dir(session_id) / "analysis.json"
     if not analysis_path.exists():
         raise HTTPException(status_code=404, detail="Analysis not found")
     with open(analysis_path, "r") as f:
@@ -878,9 +1564,9 @@ def get_analysis(session_id: str):
 
 @app.post("/api/session/{session_id}/analysis")
 def save_analysis(session_id: str, analysis: Dict[str, Any]):
-    analysis_path = resolve_session_dir(session_id) / "analysis.json"
+    analysis_path = resolve_generated_session_dir(session_id) / "analysis.json"
     analysis_dir = analysis_path.parent
-    analysis_dir.mkdir(exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
     with open(analysis_path, "w") as f:
         json.dump(analysis, f)
     return {"message": "Analysis saved"}

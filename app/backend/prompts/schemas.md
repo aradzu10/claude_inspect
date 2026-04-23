@@ -28,7 +28,7 @@ One file per conversation. The main conversation gets its own file. Each sub-age
       "role": "assistant",
       "content": "<assistant reply>",
       "tool_calls": [
-        { "id": "<call id>", "name": "<tool name>", "input": { "<param>": "<value>" } }
+        { "name": "<tool name>", "input": { "<param>": "<value>" }, "output": "<tool output text>" }
       ]
     },
     {
@@ -42,7 +42,8 @@ One file per conversation. The main conversation gets its own file. Each sub-age
       "role": "sub_agent_invocation",
       "agent_type": "<sub-agent type>",
       "conversation_id": "<sub-agent conversation id>",
-      "input": "<invocation input from parent>",
+      "description": "<sub-agent description>",
+      "prompt": "<sub-agent prompt>",
       "output_summary": "<summary returned to parent>"
     }
   ]
@@ -52,7 +53,7 @@ One file per conversation. The main conversation gets its own file. Each sub-age
 Notes:
 - `role` values: `system`, `user`, `assistant`, `tool_result`, `sub_agent_invocation`.
 - Multiple `system` messages may appear at any position.
-- Sub-agent invocations in the parent carry only `input` and `output_summary`.
+- Sub-agent invocations in the parent carry `description`, `prompt`, and `output_summary`.
 
 ## `conversation_analysis.json` — conversation analyzer output (one per conversation)
 
