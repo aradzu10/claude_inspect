@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Analysis } from '../types';
+import { isAnalysisPayload } from '../utils/analysis';
 
 export const useAnalysisStream = (
   selectedSessionId: string | null,
@@ -108,7 +109,7 @@ export const useAnalysisStream = (
         fetch(`/api/session/${sessionId}/analysis`)
           .then(res => (res.ok ? res.json() : null))
           .then(data => {
-            if (data && Array.isArray(data.frames)) {
+            if (isAnalysisPayload(data)) {
               setAnalysis(data);
             } else {
               setAnalysis(null);

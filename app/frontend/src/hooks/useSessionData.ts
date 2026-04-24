@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Analysis, Event } from '../types';
+import { isAnalysisPayload } from '../utils/analysis';
 
 export interface EventCounts {
   withSubagents: number;
@@ -39,7 +40,7 @@ export const useSessionData = (selectedSessionId: string | null) => {
       .then(([analysisData, sessionData, withSubagentsData]) => {
         const sessionEvents = Array.isArray(sessionData) ? sessionData : [];
         const allEvents = Array.isArray(withSubagentsData) ? withSubagentsData : sessionEvents;
-        setAnalysis(analysisData);
+        setAnalysis(isAnalysisPayload(analysisData) ? analysisData : null);
         setEvents(sessionEvents);
         setEventCounts({
           withSubagents: allEvents.length,

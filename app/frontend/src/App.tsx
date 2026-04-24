@@ -18,6 +18,7 @@ import { SessionView } from './components/SessionView';
 import { SubagentModal } from './components/SubagentModal';
 import { HideToast } from './components/HideToast';
 import { ConfirmDialog } from './components/ConfirmDialog';
+import { isLegacyAnalysis } from './utils/analysis';
 
 function App() {
   const [searchQuery, setSearchQuery] = useState('');
@@ -108,7 +109,7 @@ function App() {
   };
 
   const updateFrameSuggestion = (frameIndex: number, newSuggestion: string) => {
-    if (!analysis) return;
+    if (!analysis || !isLegacyAnalysis(analysis)) return;
     const newAnalysis: Analysis = { ...analysis, frames: analysis.frames.map(f => ({ ...f })) };
     newAnalysis.frames[frameIndex].suggestion = newSuggestion;
     setAnalysis(newAnalysis);
