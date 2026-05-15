@@ -12,6 +12,8 @@ export const get_content_text = (content: any): string => {
   }
   if (typeof content === 'object' && content !== null) {
     if (content.type === 'file') return `File: ${content.displayPath || content.filename}`;
+    if (content.type === 'edited_text_file') return `Edited file: ${content.filename || 'unknown file'}`;
+    if (content.type === 'date_change') return `Date changed: ${content.newDate || 'unknown date'}`;
     if (content.type === 'tool_result') return get_content_text(content.content);
     return JSON.stringify(content);
   }

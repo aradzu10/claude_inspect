@@ -35,6 +35,14 @@ describe('get_content_text', () => {
     expect(get_content_text({ type: 'file', filename: 'x.ts' })).toBe('File: x.ts');
   });
 
+  it('describes edited_text_file objects', () => {
+    expect(get_content_text({ type: 'edited_text_file', filename: 'plan.json' })).toBe('Edited file: plan.json');
+  });
+
+  it('describes date_change objects', () => {
+    expect(get_content_text({ type: 'date_change', newDate: '2026-04-30' })).toBe('Date changed: 2026-04-30');
+  });
+
   it('JSON-stringifies unknown objects', () => {
     expect(get_content_text({ foo: 'bar' })).toBe('{"foo":"bar"}');
   });

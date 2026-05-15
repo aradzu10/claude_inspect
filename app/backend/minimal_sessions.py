@@ -19,6 +19,11 @@ from .text_utils import (
 
 logger = logging.getLogger("claude-inspect")
 
+TOOL_CALL_OUTPUT_TRUNCATE_THRESHOLD = 1100
+TOOL_CALL_OUTPUT_HEAD_CHARS = 500
+TOOL_CALL_OUTPUT_TAIL_CHARS = 500
+TOOL_CALL_OUTPUT_TRUNCATION_MARKER = "\n...[truncated]...\n"
+
 
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,8 +122,18 @@ def _assistant_part_to_tool_call(part: Dict[str, Any]) -> Dict[str, Any]:
     }
     output_text = normalize_generated_text(part.get("output", ""))
     if output_text:
-        call_entry["output"] = output_text
+        call_entry["output"] = truncate_tool_call_output(output_text)
     return call_entry
+
+
+def truncate_tool_call_output(output_text: str) -> str:
+    if len(output_text) < TOOL_CALL_OUTPUT_TRUNCATE_THRESHOLD:
+        return output_text
+    return (
+        output_text[:TOOL_CALL_OUTPUT_HEAD_CHARS]
+        + TOOL_CALL_OUTPUT_TRUNCATION_MARKER
+        + output_text[-TOOL_CALL_OUTPUT_TAIL_CHARS:]
+    )
 
 
 def _append_tool_result_messages(
@@ -202,7 +217,7 @@ def build_main_minimal_session(
                             agent_id,
                             {"agentType": "unknown", "description": "Unknown agent"},
                         )
-                        description, prompt = extract_subagent_invocation_fields(tool_input)
+                        description, _prompt = extract_subagent_invocation_fields(tool_input)
                         output_summary = normalize_generated_text(part.get("output", ""))
                         invocation_message: Dict[str, Any] = {
                             "idx": -1,
@@ -212,13 +227,11 @@ def build_main_minimal_session(
                         }
                         if description:
                             invocation_message["description"] = description
-                        if prompt:
-                            invocation_message["prompt"] = prompt
                         if output_summary:
                             invocation_message["output_summary"] = output_summary
                         if any(
                             key in invocation_message
-                            for key in ("description", "prompt", "output_summary")
+                            for key in ("description", "output_summary")
                         ):
                             invocation_messages.append(invocation_message)
                     else:

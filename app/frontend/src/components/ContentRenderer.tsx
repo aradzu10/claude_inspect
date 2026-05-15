@@ -1,5 +1,5 @@
 import React from 'react';
-import { FileText } from 'lucide-react';
+import { Calendar, FileText } from 'lucide-react';
 import { ExpandableContent } from './ExpandableContent';
 
 export const renderContent = (content: any, isInsideTool = false): React.ReactNode => {
@@ -35,6 +35,36 @@ export const renderContent = (content: any, isInsideTool = false): React.ReactNo
               {fileContent}
             </pre>
           </ExpandableContent>
+        </div>
+      );
+    }
+
+    if (content.type === 'edited_text_file') {
+      return (
+        <div className="my-2 border border-amber-200 rounded-lg overflow-hidden shadow-sm">
+          <div className="bg-amber-50 px-3 py-2 border-b border-amber-200 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs font-medium text-amber-800">
+              <FileText size={14} className="text-amber-500 shrink-0" />
+              <span>Edited file</span>
+            </div>
+            <span className="text-[11px] text-amber-700 break-all whitespace-pre-wrap">{content.filename || 'unknown file'}</span>
+          </div>
+          <ExpandableContent maxHeight={300}>
+            <pre className="p-3 text-[11px] font-mono whitespace-pre-wrap bg-white overflow-x-auto text-gray-800 break-words">
+              {typeof content.snippet === 'string' && content.snippet.trim().length > 0 ? content.snippet : 'No snippet available.'}
+            </pre>
+          </ExpandableContent>
+        </div>
+      );
+    }
+
+    if (content.type === 'date_change') {
+      return (
+        <div className="my-2 p-3 bg-indigo-50/60 border border-indigo-200 rounded-lg flex items-center gap-2 text-indigo-800">
+          <Calendar size={14} className="shrink-0" />
+          <span className="text-sm">
+            Date changed to <span className="font-mono font-semibold">{content.newDate || 'unknown date'}</span>
+          </span>
         </div>
       );
     }

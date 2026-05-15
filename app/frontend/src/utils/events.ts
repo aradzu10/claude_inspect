@@ -33,6 +33,12 @@ export const getEventSummary = (event: Event): string => {
   }
   if (event.role_type === 'system') {
     if (event.attachment?.type === 'file') return `System: File ${event.attachment.filename}`;
+    if (event.attachment?.type === 'edited_text_file') {
+      return `System: Edited ${event.attachment.filename || 'unknown file'}`;
+    }
+    if (event.attachment?.type === 'date_change') {
+      return `System: Date changed to ${event.attachment.newDate || 'unknown date'}`;
+    }
     return 'System Message';
   }
   return get_content_text(event.message?.content || event.attachment || '');

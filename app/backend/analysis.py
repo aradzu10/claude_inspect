@@ -252,6 +252,9 @@ async def run_claude_prompt(
     if stderr_text:
         logger.warning("claude stderr for %s:\n%s", prompt_path.name, stderr_text)
 
+    if output_path.exists():
+        return
+
     if not stdout_text:
         raise Exception(f"Prompt {prompt_path.name} did not write output file {output_path}")
 

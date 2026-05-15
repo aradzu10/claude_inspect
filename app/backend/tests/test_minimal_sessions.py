@@ -185,6 +185,53 @@ class BuildMainMinimalSessionTests(unittest.TestCase):
         self.assertEqual(session["messages"][1]["role"], "tool_result")
         self.assertEqual(session["messages"][1]["content"], "file")
 
+    def test_tool_call_output_is_truncated_when_long(self):
+        long_output = ("A" * 500) + ("B" * 200) + ("C" * 500)
+        events = [
+            {
+                "role_type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"path": "/x"},
+                            "id": "t1",
+                            "output": long_output,
+                        },
+                    ]
+                },
+            }
+        ]
+        session = minimal_sessions.build_main_minimal_session("s", events, {})
+        output = session["messages"][0]["tool_calls"][0]["output"]
+        self.assertEqual(
+            output,
+            ("A" * 500) + "\n...[truncated]...\n" + ("C" * 500),
+        )
+
+    def test_tool_call_output_not_truncated_when_short(self):
+        short_output = "x" * 1099
+        events = [
+            {
+                "role_type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"path": "/x"},
+                            "id": "t1",
+                            "output": short_output,
+                        },
+                    ]
+                },
+            }
+        ]
+        session = minimal_sessions.build_main_minimal_session("s", events, {})
+        output = session["messages"][0]["tool_calls"][0]["output"]
+        self.assertEqual(output, short_output)
+
     def test_agent_invocation_becomes_sub_agent_invocation_message(self):
         events = [
             {
@@ -217,7 +264,7 @@ class BuildMainMinimalSessionTests(unittest.TestCase):
         self.assertEqual(msg["agent_type"], "Explore")
         self.assertEqual(msg["conversation_id"], "abc")
         self.assertEqual(msg["description"], "do it")
-        self.assertEqual(msg["prompt"], "go")
+        self.assertNotIn("prompt", msg)
         self.assertEqual(msg["output_summary"], "result")
         self.assertEqual(msg["idx"], 0)
 

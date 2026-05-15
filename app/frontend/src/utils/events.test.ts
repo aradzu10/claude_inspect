@@ -73,6 +73,22 @@ describe('getEventSummary', () => {
     });
     expect(getEventSummary(event)).toBe('System: File a.txt');
   });
+
+  it('describes system edited_text_file attachments', () => {
+    const event = makeEvent({
+      role_type: 'system',
+      attachment: { type: 'edited_text_file', filename: 'plan.json' },
+    });
+    expect(getEventSummary(event)).toBe('System: Edited plan.json');
+  });
+
+  it('describes system date_change attachments', () => {
+    const event = makeEvent({
+      role_type: 'system',
+      attachment: { type: 'date_change', newDate: '2026-04-30' },
+    });
+    expect(getEventSummary(event)).toBe('System: Date changed to 2026-04-30');
+  });
 });
 
 describe('getEventTokens', () => {
